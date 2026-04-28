@@ -217,12 +217,19 @@ Go to **Package settings → Delete this package** before triggering `ci.yml`.
 
 ### 3. GHCR package visibility
 
-On the first push the package is created as **private** by default (standard GHCR behaviour). Either:
+GHCR creates packages as **private** on the first push. App Service has no registry
+credentials and cannot pull a private image, causing `ImagePullUnauthorizedFailure`
+at startup.
 
-- Go to the package page → **Package settings** → change visibility to **Public**
-  (recommended so App Service can pull without extra credentials), **or**
-- Add the managed identity of the Web App to the package's access list with `read`
-  permission.
+`ci.yml` handles this automatically: immediately after pushing, it calls the GitHub
+API to set the package visibility to **public**. No manual action is needed on the
+happy path.
+
+If the API call fails (it emits a `::warning::` rather than failing the run), go to
+the package page manually and set visibility to Public:
+
+- Organisation: `https://github.com/orgs/<org>/packages/container/<app>`
+- Personal account: `https://github.com/users/<user>/packages/container/<app>`
 
 ---
 

@@ -67,6 +67,36 @@ jobs:
           docker push "${{ steps.meta.outputs.image_full }}"
           docker push "${{ steps.meta.outputs.image_base }}:latest"
 
+      - name: Set GHCR package visibility to public
+        # GHCR creates packages as private on first push.  App Service has no
+        # registry credentials, so a private image causes ImagePullUnauthorizedFailure
+        # at startup.  We make it public immediately after pushing so the Web App
+        # can always pull without extra credentials.
+        #
+        # The API endpoint differs for user vs organisation accounts.
+        # GITHUB_TOKEN with packages:write is sufficient for both when the
+        # package was just created by this workflow.  A soft warning is emitted
+        # if the call fails so the run doesn't fail here — check the package
+        # settings manually in that case.
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          OWNER="${{ github.repository_owner }}"
+          REPO="${{ github.event.repository.name }}"
+
+          OWNER_TYPE=$(gh api "/users/${OWNER}" --jq '.type' 2>/dev/null || echo "User")
+          echo "Account type: ${OWNER_TYPE}"
+
+          if [ "${OWNER_TYPE}" = "Organization" ]; then
+            ENDPOINT="/orgs/${OWNER}/packages/container/${REPO}"
+          else
+            ENDPOINT="/user/packages/container/${REPO}"
+          fi
+
+          gh api --method PATCH "${ENDPOINT}" -f visibility=public \
+            && echo "Package set to public — App Service can pull without credentials." \
+            || echo "::warning::Could not set package visibility automatically. Go to github.com/${OWNER}/${REPO} → Packages → ${REPO} → Package settings and set visibility to Public manually."
+
   deploy-dev:
     name: Deploy to dev
     needs: build-test-push
