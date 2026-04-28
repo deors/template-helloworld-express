@@ -185,12 +185,30 @@ done
 
 > **Future automation**: adding these federated credentials is a candidate for the platform workflow to perform automatically at provision time.
 
-### 2. GHCR package visibility
+### 2. GHCR package must not already exist under a different repo
 
-On the first push, `docker/build-push-action` creates the package as **private** by default. Either:
+GHCR ties each package permanently to the repository that first created it. If a
+package named `ghcr.io/<owner>/<app>` already exists — for example from an earlier
+test run of a repo with the same name — `GITHUB_TOKEN` from the new repo will be
+denied with `permission_denied: write_package` on every push, regardless of token
+permissions or repo settings.
 
-- Go to `https://github.com/orgs/<org>/packages` → the package → **Package settings** → change visibility to **Public** (recommended for cross-org pulls from App Service), **or**
-- Add the managed identity of the Web App to the package's access list with `read` permission.
+**If you are re-provisioning a repo with the same name**, delete the old package
+first:
+
+- Organisation: `https://github.com/orgs/<org>/packages/container/<app>`
+- Personal account: `https://github.com/users/<user>/packages/container/<app>`
+
+Go to **Package settings → Delete this package** before triggering `ci.yml`.
+
+### 3. GHCR package visibility
+
+On the first push the package is created as **private** by default (standard GHCR behaviour). Either:
+
+- Go to the package page → **Package settings** → change visibility to **Public**
+  (recommended so App Service can pull without extra credentials), **or**
+- Add the managed identity of the Web App to the package's access list with `read`
+  permission.
 
 ---
 
