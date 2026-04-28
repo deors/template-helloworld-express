@@ -116,7 +116,41 @@ Reusable workflow (`workflow_call`). Called by `ci.yml` for dev on every push; c
 
 ## Prerequisites before first use
 
-### 1. OIDC federated credentials
+### 1. Workflow permissions on the new repo
+
+When GitHub creates a repo from a template via the API, the new repo inherits the
+org/account default for `GITHUB_TOKEN` permissions, which is **read-only** unless
+changed. `ci.yml` needs `packages: write` to push to GHCR — that declaration in
+the workflow file is silently ignored if the repo default is read-only.
+
+**Fix A — org/account default (one-time, affects all future repos)**
+
+Change the default so every template-generated repo inherits read+write automatically:
+
+- Personal account: **Settings → Actions → General → Workflow permissions → Read and write permissions**
+- Organisation: **Org Settings → Actions → General → Workflow permissions → Read and write permissions**
+
+**Fix B — platform workflow (per-repo, no org setting change required)**
+
+Add this API call to the platform workflow immediately after creating the repo and
+before dispatching `ci.yml`:
+
+```bash
+gh api \
+  --method PUT \
+  /repos/$NEW_REPO_FULL_NAME/actions/permissions/workflow \
+  -f default_workflow_permissions=write
+```
+
+This is the recommended approach for fully automated provisioning — it keeps each
+repo correctly configured without relying on an org-wide default that could be
+changed by accident.
+
+> **Future automation**: this call is a candidate for the platform workflow to
+> perform automatically as part of the bootstrap sequence, alongside environment
+> and variable creation.
+
+### 2. OIDC federated credentials
 
 The platform workflow creates the service principal and its initial federated credentials scoped to the **platform repo**. For `deploy.yml` to authenticate from the **new app repo**, the same SP needs an additional federated credential per environment:
 
