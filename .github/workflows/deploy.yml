@@ -63,10 +63,26 @@ jobs:
             --resource-group "${{ vars.AZURE_RESOURCE_GROUP }}" \
             --name            "${{ vars.AZURE_WEBAPP_NAME }}"
 
-      - name: Smoke test – /health
-        # Polls until the app reports healthy or times out after 3 minutes.
-        # If private_endpoint_enabled=true for this environment, replace the curl
-        # with the control-plane check below (comment in / comment out as needed).
+      # -----------------------------------------------------------------------
+      # Validation strategy differs by environment network exposure:
+      #
+      #   dev     — public endpoint is open (public_network_access_enabled=true
+      #             in Terraform).  Poll /health over HTTPS from the runner.
+      #
+      #   staging / prod — private-endpoint-only (public_network_access_enabled
+      #             =false).  The public hostname is unreachable from GitHub-
+      #             hosted runners, so we use control-plane assertions instead:
+      #               • az webapp show   → App Service state == Running
+      #               • az webapp config container show → linuxFxVersion contains
+      #                 the expected image tag
+      #
+      # See docs/SETUP.md § "Deploy validation strategy" for full rationale.
+      # To use HTTP validation against staging/prod, provision self-hosted runners
+      # inside the VNet and remove the environment condition below.
+      # -----------------------------------------------------------------------
+
+      - name: Validate – HTTP smoke test (dev)
+        if: inputs.environment == 'dev'
         run: |
           WEBAPP_URL="https://${{ vars.AZURE_WEBAPP_NAME }}.azurewebsites.net"
           echo "Smoke-testing ${WEBAPP_URL}/health …"
@@ -86,18 +102,28 @@ jobs:
           echo "Health check timed out after 3 minutes."
           exit 1
 
-        # --- Alternative smoke test for private-endpoint-only environments ---
-        # Uncomment the block below and comment out the curl block above when
-        # private_endpoint_enabled=true so the public hostname is not reachable.
-        #
-        # - name: Smoke test – control-plane state check
-        #   run: |
-        #     STATE=$(az webapp show \
-        #       --resource-group "${{ vars.AZURE_RESOURCE_GROUP }}" \
-        #       --name            "${{ vars.AZURE_WEBAPP_NAME }}" \
-        #       --query state -o tsv)
-        #     echo "App Service state: ${STATE}"
-        #     [ "${STATE}" = "Running" ]
+      - name: Validate – control-plane assertions (staging / prod)
+        if: inputs.environment != 'dev'
+        run: |
+          echo "=== App Service state ==="
+          STATE=$(az webapp show \
+            --resource-group "${{ vars.AZURE_RESOURCE_GROUP }}" \
+            --name            "${{ vars.AZURE_WEBAPP_NAME }}" \
+            --query state -o tsv)
+          echo "State: ${STATE}"
+          [[ "${STATE}" == "Running" ]] \
+            || { echo "::error::App not Running (state=${STATE})"; exit 1; }
+
+          echo "=== Deployed image tag ==="
+          IMG=$(az webapp config container show \
+            --resource-group "${{ vars.AZURE_RESOURCE_GROUP }}" \
+            --name            "${{ vars.AZURE_WEBAPP_NAME }}" \
+            --query linuxFxVersion -o tsv)
+          echo "linuxFxVersion: ${IMG}"
+          grep -q "${{ inputs.image_tag }}" <<<"${IMG}" \
+            || { echo "::error::Deployed image (${IMG}) does not contain expected tag (${{ inputs.image_tag }})"; exit 1; }
+
+          echo "Control-plane validation passed."
 
       - name: Confirm deployed version
         run: |

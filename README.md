@@ -108,9 +108,23 @@ Reusable workflow (`workflow_call`). Called by `ci.yml` for dev on every push; c
 2. `az webapp config container set` — points the existing Web App at the new image (no infrastructure changes).
 3. `az webapp config appsettings set` — injects `APP_ENV`, `IMAGE_TAG`, `APP_NAME`.
 4. `az webapp restart`.
-5. Smoke test: polls `GET https://<webapp>.azurewebsites.net/health` every 10 s for up to 3 min.
+5. Validation — strategy depends on the environment's network exposure (see below).
 
-> **Private-endpoint environments** — if `private_endpoint_enabled=true` for an environment (typically staging/prod), the public `/health` endpoint is not reachable from GitHub-hosted runners. Switch the smoke test to the control-plane state check documented in `deploy.yml` (comment block at the bottom of the smoke-test step).
+**Deploy validation strategy**
+
+The platform provisions environments with different network exposure:
+
+| Environment | `public_network_access_enabled` | Validation method |
+|-------------|--------------------------------|-------------------|
+| `dev` | `true` — public endpoint open | HTTP: polls `GET /health` every 10 s, up to 3 min |
+| `staging` | `false` — private endpoint only | Control-plane: `az webapp show` (state) + `az webapp config container show` (image tag) |
+| `prod` | `false` — private endpoint only | Control-plane: same as staging |
+
+The public hostname for staging/prod is unreachable from GitHub-hosted runners because the private endpoint disables public network access. The control-plane assertions confirm the App Service is `Running` and that `linuxFxVersion` contains the expected image tag — equivalent confidence without requiring network access to the app.
+
+To use HTTP validation against staging/prod, provision self-hosted runners inside the VNet and remove the `if: inputs.environment != 'dev'` condition in `deploy.yml`.
+
+See `docs/SETUP.md` for full rationale.
 
 ---
 
