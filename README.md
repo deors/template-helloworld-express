@@ -215,21 +215,108 @@ first:
 
 Go to **Package settings → Delete this package** before triggering `ci.yml`.
 
-### 3. GHCR package visibility
+### 3. GHCR package visibility and App Service pull access
 
 GHCR creates packages as **private** on the first push. App Service has no registry
-credentials and cannot pull a private image, causing `ImagePullUnauthorizedFailure`
-at startup.
+credentials by default and cannot pull a private image, causing
+`ImagePullUnauthorizedFailure` at startup. There are three strategies; choose the
+one that matches your context.
+
+---
+
+#### Strategy 1 — Public package (this template's default; suitable for workshops)
+
+For a workshop using a public repository, making the container image public is the
+right trade-off: the source code is already open, so the built artefact being
+publicly pullable adds no meaningful exposure.
 
 `ci.yml` handles this automatically: immediately after pushing, it calls the GitHub
 API to set the package visibility to **public**. No manual action is needed on the
 happy path.
 
-If the API call fails (it emits a `::warning::` rather than failing the run), go to
-the package page manually and set visibility to Public:
+If the API call fails (it emits a `::warning::` rather than failing the run), set
+visibility manually:
 
 - Organisation: `https://github.com/orgs/<org>/packages/container/<app>`
 - Personal account: `https://github.com/users/<user>/packages/container/<app>`
+
+---
+
+#### Strategy 2 — Private GHCR package with stored credentials
+
+App Service can pull a private GHCR image if registry credentials are passed when
+the container is configured. In `deploy.yml`, add three flags to the
+`az webapp config container set` call:
+
+```bash
+az webapp config container set \
+  --container-registry-url      "https://ghcr.io" \
+  --container-registry-user     "<github-username>" \
+  --container-registry-password "<classic-pat-read-packages>"
+```
+
+The password must be a **classic PAT** with the `read:packages` scope (fine-grained
+PATs do not support GHCR). App Service persists the credentials and uses them for
+every subsequent pull — restarts, scale-out, slot swaps.
+
+**Downsides to be aware of:**
+- Classic PATs are long-lived and do not rotate automatically; a rotation process
+  must be put in place.
+- The credential is stored in plain text in the App Service configuration unless
+  you use an [Azure Key Vault reference](https://learn.microsoft.com/azure/app-service/app-service-key-vault-references)
+  (`@Microsoft.KeyVault(...)` syntax in the app setting value).
+- If the PAT expires or is revoked all environments using it break simultaneously.
+
+Suitable for private repositories where the image must stay private, and where the
+operational cost of PAT rotation is acceptable.
+
+---
+
+#### Strategy 3 — Azure Container Registry + Managed Identity (recommended for production)
+
+The cleanest production approach avoids credentials entirely by replacing GHCR with
+**Azure Container Registry (ACR)** and leveraging the user-assigned managed identity
+already provisioned by the platform.
+
+The platform grants the Web App's managed identity the `AcrPull` role on the ACR.
+App Service uses the MI to authenticate transparently — no PAT, no secret, nothing
+to rotate.
+
+The workflow change is small: replace the `docker login ghcr.io` / `docker push`
+steps with `az acr login` (authenticated via OIDC, same as the rest of the deploy)
+and push to `<registry>.azurecr.io/<app>:<tag>` instead.
+
+```
+ci.yml: build → az acr login → docker push <acr>/<app>:<tag>
+deploy.yml: az webapp config container set → <acr>/<app>:<tag>  (no --registry-* flags needed)
+```
+
+**What changes on the platform side:**
+- Terraform provisions an ACR resource and a role assignment (`AcrPull`) linking the
+  Web App's managed identity to the ACR.
+- The `AZURE_REGISTRY_NAME` (e.g. `crMyAppDev`) is added as a per-environment
+  GitHub variable alongside the existing ones.
+
+**Benefits over strategies 1 and 2:**
+- Zero credentials in the pipeline or in App Service configuration.
+- The MI token is managed by Azure and never expires.
+- Works equally well for dev, staging, and prod with no changes to the workflow.
+- Integrates with Defender for Containers, geo-replication, and content trust if
+  needed.
+
+This is the recommended path for any workload moving beyond the workshop stage.
+
+---
+
+**Summary**
+
+| | Public GHCR | Private GHCR + PAT | ACR + MI |
+|---|---|---|---|
+| Image visibility | Public | Private | Private |
+| Credentials required | None | Classic PAT (`read:packages`) | None (Managed Identity) |
+| Rotation required | — | Yes (manual) | No |
+| Platform changes needed | None | Workflow only | Terraform + workflow |
+| Recommended for | Workshops / OSS | Private repos (short-term) | Production |
 
 ---
 
