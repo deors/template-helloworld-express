@@ -1,0 +1,107 @@
+name: Deploy
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        description: Target environment (dev | staging | prod)
+        type: string
+        required: true
+      image_tag:
+        description: Container image tag to deploy (e.g. sha-abc1234)
+        type: string
+        required: true
+
+jobs:
+  deploy:
+    name: Deploy ${{ inputs.image_tag }} → ${{ inputs.environment }}
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Azure login (OIDC)
+        uses: azure/login@v3
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Resolve image reference
+        id: image
+        run: |
+          OWNER=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
+          REPO=$(echo "${{ github.event.repository.name }}" | tr '[:upper:]' '[:lower:]')
+          echo "ref=ghcr.io/${OWNER}/${REPO}:${{ inputs.image_tag }}" >> "$GITHUB_OUTPUT"
+
+      - name: Update Web App container image
+        run: |
+          az webapp config container set \
+            --resource-group "${{ vars.AZURE_RESOURCE_GROUP }}" \
+            --name            "${{ vars.AZURE_WEBAPP_NAME }}" \
+            --container-image-name "${{ steps.image.outputs.ref }}"
+
+      - name: Set runtime environment variables
+        run: |
+          az webapp config appsettings set \
+            --resource-group "${{ vars.AZURE_RESOURCE_GROUP }}" \
+            --name            "${{ vars.AZURE_WEBAPP_NAME }}" \
+            --settings \
+              APP_ENV="${{ inputs.environment }}" \
+              IMAGE_TAG="${{ inputs.image_tag }}" \
+              APP_NAME="${{ github.event.repository.name }}"
+
+      - name: Restart Web App
+        run: |
+          az webapp restart \
+            --resource-group "${{ vars.AZURE_RESOURCE_GROUP }}" \
+            --name            "${{ vars.AZURE_WEBAPP_NAME }}"
+
+      - name: Smoke test – /health
+        # Polls until the app reports healthy or times out after 3 minutes.
+        # If private_endpoint_enabled=true for this environment, replace the curl
+        # with the control-plane check below (comment in / comment out as needed).
+        run: |
+          WEBAPP_URL="https://${{ vars.AZURE_WEBAPP_NAME }}.azurewebsites.net"
+          echo "Smoke-testing ${WEBAPP_URL}/health …"
+
+          for i in $(seq 1 18); do
+            STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+              --max-time 10 \
+              "${WEBAPP_URL}/health" || echo "000")
+            echo "  attempt ${i}: HTTP ${STATUS}"
+            if [ "${STATUS}" = "200" ]; then
+              echo "Health check passed."
+              exit 0
+            fi
+            sleep 10
+          done
+
+          echo "Health check timed out after 3 minutes."
+          exit 1
+
+        # --- Alternative smoke test for private-endpoint-only environments ---
+        # Uncomment the block below and comment out the curl block above when
+        # private_endpoint_enabled=true so the public hostname is not reachable.
+        #
+        # - name: Smoke test – control-plane state check
+        #   run: |
+        #     STATE=$(az webapp show \
+        #       --resource-group "${{ vars.AZURE_RESOURCE_GROUP }}" \
+        #       --name            "${{ vars.AZURE_WEBAPP_NAME }}" \
+        #       --query state -o tsv)
+        #     echo "App Service state: ${STATE}"
+        #     [ "${STATE}" = "Running" ]
+
+      - name: Confirm deployed version
+        run: |
+          WEBAPP_URL="https://${{ vars.AZURE_WEBAPP_NAME }}.azurewebsites.net"
+          echo "Deployed image : ${{ steps.image.outputs.ref }}"
+          echo "App URL        : ${WEBAPP_URL}"
+          echo "Whois endpoint : ${WEBAPP_URL}/whois"
