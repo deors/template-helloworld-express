@@ -104,7 +104,7 @@ Reusable workflow (`workflow_call`). Called by `ci.yml` for dev on every push; c
 
 **Deploy steps**
 
-1. OIDC login via `azure/login@v2` using the variables above.
+1. OIDC login via `azure/login@v3` using the variables above.
 2. `az webapp config container set` — points the existing Web App at the new image (no infrastructure changes).
 3. `az webapp config appsettings set` — injects `APP_ENV`, `IMAGE_TAG`, `APP_NAME`.
 4. `az webapp restart`.
