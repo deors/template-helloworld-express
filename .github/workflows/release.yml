@@ -1,0 +1,166 @@
+name: Release
+
+# Triggered automatically when a GitHub Release is created.
+# workflow_dispatch is provided for testing without creating a real release.
+#
+# Release tag naming rules:
+#   X.Y.Z        → deploy to prod   (GA release)
+#   X.Y.Z-RC     → deploy to staging (release candidate)
+#   v prefix is accepted: v1.2.3, v1.2.3-RC
+#   Any other format fails the workflow immediately.
+
+on:
+  release:
+    types: [created]
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: >
+          Release tag — X.Y.Z for prod or X.Y.Z-RC for staging (v prefix optional).
+        type: string
+        required: true
+
+permissions:
+  contents: read
+  packages: write
+  id-token: write
+
+jobs:
+
+  # ---------------------------------------------------------------------------
+  # 1. Validate the release tag and decide the target environment.
+  # ---------------------------------------------------------------------------
+  validate:
+    name: Validate release tag
+    runs-on: ubuntu-latest
+    outputs:
+      release_tag: ${{ steps.parse.outputs.release_tag }}
+      target_env:  ${{ steps.parse.outputs.target_env }}
+
+    steps:
+      - name: Parse and validate release tag
+        id: parse
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TAG="${{ inputs.release_tag }}"
+          else
+            TAG="${{ github.event.release.tag_name }}"
+          fi
+          echo "Release tag: ${TAG}"
+
+          # Strip optional v prefix before semver validation
+          CLEAN="${TAG#v}"
+
+          if [[ "${CLEAN}" =~ ^[0-9]+\.[0-9]+\.[0-9]+-RC$ ]]; then
+            TARGET_ENV="staging"
+            echo "Release candidate → target: staging"
+          elif [[ "${CLEAN}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            TARGET_ENV="prod"
+            echo "GA release → target: prod"
+          else
+            echo "::error::Invalid release tag '${TAG}'." \
+              "Expected X.Y.Z (prod) or X.Y.Z-RC (staging), with optional v prefix."
+            exit 1
+          fi
+
+          {
+            echo "release_tag=${TAG}"
+            echo "target_env=${TARGET_ENV}"
+          } >> "$GITHUB_OUTPUT"
+
+  # ---------------------------------------------------------------------------
+  # 2. Query the dev Web App to find the sha-* image tag currently running.
+  #    Uses the dev GitHub Environment so OIDC auth targets the dev SP.
+  # ---------------------------------------------------------------------------
+  identify-image:
+    name: Identify image deployed to dev
+    needs: validate
+    runs-on: ubuntu-latest
+    environment: dev
+    permissions:
+      id-token: write
+      contents: read
+    outputs:
+      image_base: ${{ steps.image.outputs.image_base }}
+      sha_tag:    ${{ steps.image.outputs.sha_tag }}
+
+    steps:
+      - name: Azure login (OIDC)
+        uses: azure/login@v3
+        with:
+          client-id:       ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id:       ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Read current image from dev Web App
+        id: image
+        run: |
+          RAW=$(az webapp config container show \
+            --resource-group "${{ vars.AZURE_RESOURCE_GROUP }}" \
+            --name            "${{ vars.AZURE_WEBAPP_NAME }}" \
+            --query linuxFxVersion -o tsv)
+
+          echo "Raw linuxFxVersion: ${RAW}"
+
+          # Strip DOCKER| prefix emitted by App Service
+          FULL="${RAW#DOCKER|}"
+          IMAGE_BASE="${FULL%:*}"
+          SHA_TAG="${FULL##*:}"
+
+          if [[ "${IMAGE_BASE}" != ghcr.io/* ]]; then
+            echo "::error::Dev Web App is not running a GHCR image (got: ${IMAGE_BASE})." \
+              "Run ci.yml successfully before creating a release."
+            exit 1
+          fi
+
+          echo "Image base : ${IMAGE_BASE}"
+          echo "SHA tag    : ${SHA_TAG}"
+
+          {
+            echo "image_base=${IMAGE_BASE}"
+            echo "sha_tag=${SHA_TAG}"
+          } >> "$GITHUB_OUTPUT"
+
+  # ---------------------------------------------------------------------------
+  # 3. Add the release tag to the image already in GHCR.
+  #    No layers are changed — this is a manifest retag only.
+  #    After this step the same image digest carries both tags:
+  #      sha-<short>   → traceability back to the commit
+  #      X.Y.Z[-RC]    → release identity
+  # ---------------------------------------------------------------------------
+  retag-image:
+    name: Retag image with release version
+    needs: [validate, identify-image]
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Log in to GHCR
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" \
+            | docker login ghcr.io -u "${{ github.repository_owner }}" --password-stdin
+
+      - name: Pull, retag and push
+        run: |
+          SRC="${{ needs.identify-image.outputs.image_base }}:${{ needs.identify-image.outputs.sha_tag }}"
+          DST="${{ needs.identify-image.outputs.image_base }}:${{ needs.validate.outputs.release_tag }}"
+
+          echo "Source : ${SRC}"
+          echo "New tag: ${DST}"
+
+          docker pull "${SRC}"
+          docker tag  "${SRC}" "${DST}"
+          docker push "${DST}"
+
+          echo "Pushed: ${DST}"
+
+  # ---------------------------------------------------------------------------
+  # 4. Deploy the release-tagged image to the target environment.
+  # ---------------------------------------------------------------------------
+  deploy:
+    name: Deploy ${{ needs.validate.outputs.release_tag }} to ${{ needs.validate.outputs.target_env }}
+    needs: [validate, retag-image]
+    uses: ./.github/workflows/deploy.yml
+    with:
+      environment: ${{ needs.validate.outputs.target_env }}
+      image_tag:   ${{ needs.validate.outputs.release_tag }}
+    secrets: inherit

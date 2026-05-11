@@ -81,9 +81,43 @@ push / workflow_dispatch
 
 The entire run — including the dev deploy — must be green for the platform to consider bootstrap successful.
 
+### `release.yml` — Release & Promotion
+
+Triggered when a **GitHub Release is created**. Also has a `workflow_dispatch` trigger for testing without creating a real release.
+
+```
+release created / workflow_dispatch
+  └─ validate
+        └─ parse tag → determine target environment
+  └─ identify-image  (environment: dev)
+        └─ OIDC login → az webapp config container show → extract sha-* tag
+  └─ retag-image
+        └─ docker pull sha-tag → docker tag release-tag → docker push
+  └─ deploy  (calls deploy.yml with target environment + release tag)
+```
+
+**Release tag naming rules**
+
+| Tag format | Example | Target |
+|------------|---------|--------|
+| `X.Y.Z` | `1.4.0` | `prod` |
+| `X.Y.Z-RC` | `1.4.0-RC` | `staging` |
+| `vX.Y.Z` / `vX.Y.Z-RC` | `v1.4.0-RC` | same as above, `v` prefix accepted |
+| Any other format | `1.4.0-beta` | workflow fails immediately |
+
+**Image tagging strategy**
+
+The workflow does not build a new image. It reads the `sha-*` tag currently deployed to dev (via `az webapp config container show`), adds the release version as a second tag to the same image digest in GHCR, and deploys that tag to the target environment. At any point in time the same image may carry multiple tags:
+
+| Tag | Meaning |
+|-----|---------|
+| `sha-abc1234` | built from commit `abc1234`, deployed to dev |
+| `1.4.0-RC` | promoted to staging as release candidate |
+| `1.4.0` | promoted to prod as GA release |
+
 ### `deploy.yml` — Reusable Deploy
 
-Reusable workflow (`workflow_call`). Called by `ci.yml` for dev on every push; called by a separate promotion workflow (not in this template) for staging/prod.
+Reusable workflow (`workflow_call`). Called by `ci.yml` for dev on every push and by `release.yml` for staging/prod promotions.
 
 **Inputs**
 
@@ -324,10 +358,13 @@ This is the recommended path for any workload moving beyond the workshop stage.
 
 | Scenario | Tags produced |
 |----------|---------------|
-| Push to `main` | `sha-<7-char-sha>`, `latest` |
-| `workflow_dispatch` from platform | `sha-<7-char-sha>`, `latest` |
+| Push to `main` / bootstrap dispatch | `sha-<7-char-sha>`, `latest` |
+| Release candidate (`X.Y.Z-RC`) | `sha-<7-char-sha>` *(existing)* + `X.Y.Z-RC` |
+| GA release (`X.Y.Z`) | `sha-<7-char-sha>` *(existing)* + `X.Y.Z` |
 
-The `deploy.yml` always uses the immutable `sha-*` tag; `:latest` is a convenience alias.
+The `sha-*` tag is the immutable build identity. Release tags are added to the same
+digest by `release.yml` without rebuilding. `:latest` always points to the most
+recent `main` push.
 
 ---
 
@@ -341,7 +378,8 @@ The `deploy.yml` always uses the immutable `sha-*` tag; `:latest` is a convenien
 ├── .github/
 │   └── workflows/
 │       ├── ci.yml        # Build → test → push → deploy-dev
-│       └── deploy.yml    # Reusable deploy (any env)
+│       ├── deploy.yml    # Reusable deploy (any env)
+│       └── release.yml   # Release validation → retag → promote to staging/prod
 ├── Dockerfile
 ├── .dockerignore
 ├── .gitignore
