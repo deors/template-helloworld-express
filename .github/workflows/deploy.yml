@@ -37,31 +37,33 @@ jobs:
         id: image
         run: |
           OWNER=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
-          REPO=$(echo "${{ github.event.repository.name }}" | tr '[:upper:]' '[:lower:]')
+          # $GITHUB_REPOSITORY is always owner/repo — reliable in reusable workflows
+          # unlike github.event.repository.name which is empty under workflow_call.
+          REPO=$(echo "${GITHUB_REPOSITORY##*/}" | tr '[:upper:]' '[:lower:]')
           echo "ref=ghcr.io/${OWNER}/${REPO}:${{ inputs.image_tag }}" >> "$GITHUB_OUTPUT"
-
-      - name: Update Web App container image
-        run: |
-          az webapp config container set \
-            --resource-group "${{ vars.AZURE_RESOURCE_GROUP }}" \
-            --name            "${{ vars.AZURE_WEBAPP_NAME }}" \
-            --container-image-name "${{ steps.image.outputs.ref }}"
+          echo "app_name=${GITHUB_REPOSITORY##*/}" >> "$GITHUB_OUTPUT"
 
       - name: Set runtime environment variables
+        # Must run BEFORE the container update so that when App Service restarts
+        # to pull the new image it already has the correct env vars in place.
         run: |
           az webapp config appsettings set \
             --resource-group "${{ vars.AZURE_RESOURCE_GROUP }}" \
             --name            "${{ vars.AZURE_WEBAPP_NAME }}" \
             --settings \
+              APP_NAME="${{ steps.image.outputs.app_name }}" \
               APP_ENV="${{ inputs.environment }}" \
-              IMAGE_TAG="${{ inputs.image_tag }}" \
-              APP_NAME="${{ github.event.repository.name }}"
+              IMAGE_TAG="${{ inputs.image_tag }}"
 
-      - name: Restart Web App
+      - name: Update Web App container image
+        # Changing the image triggers an App Service restart automatically.
+        # Because app settings were applied in the previous step, the new
+        # container starts with all three env vars already present.
         run: |
-          az webapp restart \
+          az webapp config container set \
             --resource-group "${{ vars.AZURE_RESOURCE_GROUP }}" \
-            --name            "${{ vars.AZURE_WEBAPP_NAME }}"
+            --name            "${{ vars.AZURE_WEBAPP_NAME }}" \
+            --container-image-name "${{ steps.image.outputs.ref }}"
 
       # -----------------------------------------------------------------------
       # Validation strategy differs by environment network exposure:
