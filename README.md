@@ -8,7 +8,9 @@ When an operator clicks **Provision Infrastructure**, the platform workflow:
 2. Creates a new repo under the same org using **this template**.
 3. Opens a tracking issue in the new repo.
 4. Creates GitHub Environments (`dev`, `staging`, `prod`) and writes per-environment **variables** into each.
-5. Dispatches **`ci.yml`** in the new repo and watches that single run.
+5. Watches the **`ci.yml`** run that GitHub auto-triggers from the initial
+   `push` to `main` after template generation (the platform doesn't dispatch
+   it — it observes the auto-trigger).
 6. Posts a summary on the tracking issue once the run completes.
 
 The run is considered successful when `ci.yml` (which includes a dev deploy) reaches `success`.
@@ -164,24 +166,15 @@ See `docs/SETUP.md` for full rationale.
 
 ## Prerequisites before first use
 
-### 1. Workflow permissions on the new repo
+### 1. Workflow permissions on the new repo — handled automatically
 
 When GitHub creates a repo from a template via the API, the new repo inherits the
 org/account default for `GITHUB_TOKEN` permissions, which is **read-only** unless
 changed. `ci.yml` needs `packages: write` to push to GHCR — that declaration in
 the workflow file is silently ignored if the repo default is read-only.
 
-**Fix A — org/account default (one-time, affects all future repos)**
-
-Change the default so every template-generated repo inherits read+write automatically:
-
-- Personal account: **Settings → Actions → General → Workflow permissions → Read and write permissions**
-- Organisation: **Org Settings → Actions → General → Workflow permissions → Read and write permissions**
-
-**Fix B — platform workflow (per-repo, no org setting change required)**
-
-Add this API call to the platform workflow immediately after creating the repo and
-before dispatching `ci.yml`:
+**The platform workflow handles this for you.** Immediately after creating the
+repo from the template, the platform's `create-app-repo` job calls:
 
 ```bash
 gh api \
@@ -190,13 +183,18 @@ gh api \
   -f default_workflow_permissions=write
 ```
 
-This is the recommended approach for fully automated provisioning — it keeps each
-repo correctly configured without relying on an org-wide default that could be
-changed by accident.
+so the very first `ci.yml` run already has the permissions it needs. No operator
+action required.
 
-> **Future automation**: this call is a candidate for the platform workflow to
-> perform automatically as part of the bootstrap sequence, alongside environment
-> and variable creation.
+If you'd rather rely on an org-wide default instead (so every new repo inherits
+the right permission without per-repo API calls), set:
+
+- Personal account: **Settings → Actions → General → Workflow permissions → Read and write permissions**
+- Organisation: **Org Settings → Actions → General → Workflow permissions → Read and write permissions**
+
+The per-repo PUT is the recommended path for fully automated provisioning because
+it doesn't rely on an org-wide default that could be changed by accident — but
+both work.
 
 ### 2. OIDC federated credentials
 
