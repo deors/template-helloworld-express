@@ -162,7 +162,20 @@ The public hostname for staging/prod is unreachable from GitHub-hosted runners b
 
 To use HTTP validation against staging/prod, provision self-hosted runners inside the VNet and remove the `if: inputs.environment != 'dev'` condition in `deploy.yml`.
 
-See `docs/SETUP.md` for full rationale.
+**What the underlying infrastructure must provide for this to work as
+described:** each environment is expected to be an Azure App Service (Linux,
+container) with a User-Assigned Managed Identity, VNet integration, and a
+Private Endpoint for inbound traffic. The dev App Service is provisioned
+with `public_network_access_enabled = true` so its `<webapp>.azurewebsites.net`
+hostname is reachable from anywhere; staging and prod have
+`public_network_access_enabled = false`, leaving the Private Endpoint as the
+only ingress path — which is unreachable from GitHub-hosted runners (no
+fixed egress IP, not in the VNet). The App Service is configured with
+`health_check_path = "/health"` so the platform's own per-instance health
+probes substitute for the runner's HTTP smoke test on PE-only
+environments. Any infrastructure deviating from this — for example an App
+Service that closes public access in dev, or one without `/health` — needs
+matching changes to `deploy.yml`.
 
 ---
 
@@ -239,10 +252,31 @@ for ENV in dev staging prod; do
 done
 ```
 
-> **Prerequisite for the automated path:** the platform SP must be an owner
-> of its own App Registration **and** hold the Microsoft Graph
-> `Application.ReadWrite.OwnedBy` application permission (admin-consented).
-> See the platform repo's `docs/SETUP.md` step 5 for the one-time setup.
+> **Prerequisite for the automated path** (one-time setup, owned by the
+> platform side — but listed here for completeness):
+>
+> 1. The platform service principal must be added as an **owner** of its
+>    own App Registration:
+>    ```bash
+>    APP_OBJECT_ID=$(az ad app show --id "$CLIENT_ID" --query id -o tsv)
+>    SP_OBJECT_ID=$(az ad sp show --id "$CLIENT_ID" --query id -o tsv)
+>    az ad app owner add --id "$APP_OBJECT_ID" --owner-object-id "$SP_OBJECT_ID"
+>    ```
+>    Ownership alone covers user-delegated flows, but not the
+>    application-only flow a workflow's OIDC token runs under.
+>
+> 2. The SP must hold the Microsoft Graph **application permission**
+>    `Application.ReadWrite.OwnedBy` with admin consent. Grant via Entra
+>    Portal (*App registrations → API permissions → Add → Microsoft Graph
+>    → Application permissions → `Application.ReadWrite.OwnedBy` → Grant
+>    admin consent*) or with `az rest` POST against
+>    `/v1.0/servicePrincipals/<sp-id>/appRoleAssignments`.
+>
+> Without (2), the automated fed-cred call returns
+> `Insufficient privileges to complete the operation` even with full
+> ownership. `Application.ReadWrite.OwnedBy` (not `…OwnedBy.All` or
+> `…All`) keeps the SP's blast radius to App Registrations it owns —
+> which, after step 1, is exactly one: itself.
 
 ### 3. GHCR package must not already exist under a different repo
 
