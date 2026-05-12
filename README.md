@@ -94,7 +94,7 @@ release created / workflow_dispatch
   └─ validate
         └─ parse tag → determine target environment
   └─ identify-image  (environment: dev)
-        └─ OIDC login → az webapp config container show → extract sha-* tag
+        └─ OIDC login → az webapp config show → extract sha-* tag
   └─ retag-image
         └─ docker pull sha-tag → docker tag release-tag → docker push
   └─ deploy  (calls deploy.yml with target environment + release tag)
@@ -111,7 +111,7 @@ release created / workflow_dispatch
 
 **Image tagging strategy**
 
-The workflow does not build a new image. It reads the `sha-*` tag currently deployed to dev (via `az webapp config container show`), adds the release version as a second tag to the same image digest in GHCR, and deploys that tag to the target environment. At any point in time the same image may carry multiple tags:
+The workflow does not build a new image. It reads the `sha-*` tag currently deployed to dev (via `az webapp config show`), adds the release version as a second tag to the same image digest in GHCR, and deploys that tag to the target environment. At any point in time the same image may carry multiple tags:
 
 | Tag | Meaning |
 |-----|---------|
@@ -140,13 +140,17 @@ Reusable workflow (`workflow_call`). Called by `ci.yml` for dev on every push an
 | `AZURE_RESOURCE_GROUP` | `rg-myapp-dev` |
 | `AZURE_WEBAPP_NAME` | `app-myapp-dev` |
 
-**Deploy steps**
+**Deploy steps** (in this order)
 
 1. OIDC login via `azure/login@v3` using the variables above.
-2. `az webapp config container set` — points the existing Web App at the new image (no infrastructure changes).
-3. `az webapp config appsettings set` — injects `APP_ENV`, `IMAGE_TAG`, `APP_NAME`.
-4. `az webapp restart`.
-5. Validation — strategy depends on the environment's network exposure (see below).
+2. `az webapp config appsettings set` — injects `APP_NAME`, `APP_ENV`,
+   `IMAGE_TAG`. Runs **before** the container update so the new container
+   starts with the right env vars already in place.
+3. `az webapp config container set` — points the existing Web App at the new
+   image (no infrastructure changes). Changing the image triggers an App
+   Service restart automatically; no explicit `az webapp restart` is needed.
+4. Validation — strategy depends on the environment's network exposure (see
+   below).
 
 **Deploy validation strategy**
 
@@ -155,7 +159,7 @@ The platform provisions environments with different network exposure:
 | Environment | `public_network_access_enabled` | Validation method |
 |-------------|--------------------------------|-------------------|
 | `dev` | `true` — public endpoint open | HTTP: polls `GET /health` every 10 s, up to 3 min |
-| `staging` | `false` — private endpoint only | Control-plane: `az webapp show` (state) + `az webapp config container show` (image tag) |
+| `staging` | `false` — private endpoint only | Control-plane: `az webapp show` (state) + `az webapp config show` (image tag) |
 | `prod` | `false` — private endpoint only | Control-plane: same as staging |
 
 The public hostname for staging/prod is unreachable from GitHub-hosted runners because the private endpoint disables public network access. The control-plane assertions confirm the App Service is `Running` and that `linuxFxVersion` contains the expected image tag — equivalent confidence without requiring network access to the app.

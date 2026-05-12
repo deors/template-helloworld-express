@@ -74,13 +74,12 @@ jobs:
       #   staging / prod — private-endpoint-only (public_network_access_enabled
       #             =false).  The public hostname is unreachable from GitHub-
       #             hosted runners, so we use control-plane assertions instead:
-      #               • az webapp show   → App Service state == Running
-      #               • az webapp config container show → linuxFxVersion contains
-      #                 the expected image tag
+      #               • az webapp show          → App Service state == Running
+      #               • az webapp config show   → linuxFxVersion contains
+      #                                           the expected image tag
       #
-      # See docs/SETUP.md § "Deploy validation strategy" for full rationale.
-      # To use HTTP validation against staging/prod, provision self-hosted runners
-      # inside the VNet and remove the environment condition below.
+      # To use HTTP validation against staging/prod, provision self-hosted
+      # runners inside the VNet and remove the environment condition below.
       # -----------------------------------------------------------------------
 
       - name: Validate – HTTP smoke test (dev)
