@@ -149,7 +149,13 @@ Reusable workflow (`workflow_call`). Called by `ci.yml` for dev on every push an
 3. `az webapp config container set` — points the existing Web App at the new
    image (no infrastructure changes). Changing the image triggers an App
    Service restart automatically; no explicit `az webapp restart` is needed.
-4. Validation — strategy depends on the environment's network exposure (see
+4. **Wait for the App Service to become healthy** — polls the per-instance
+   state via the ARM REST API (`Microsoft.Web/sites/.../instances`), up to
+   5 attempts with 5 s between, expecting every instance to report `READY`.
+   This gives the asynchronous container swap up to ~25 s to settle before
+   validation runs, and works the same way for dev, staging, and prod
+   regardless of network exposure.
+5. Validation — strategy depends on the environment's network exposure (see
    below).
 
 **Deploy validation strategy**

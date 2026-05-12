@@ -65,6 +65,40 @@ jobs:
             --name            "${{ vars.AZURE_WEBAPP_NAME }}" \
             --container-image-name "${{ steps.image.outputs.ref }}"
 
+      - name: Wait for App Service to become healthy
+        # Container image swap is asynchronous: the Web App stays "Running"
+        # at the control-plane level, but the worker instances cycle as the
+        # new image is pulled and started. Poll the per-instance state via
+        # the ARM REST API until every instance reports `READY` — which is
+        # the App Service signal that the new container has replaced the
+        # previous one on that instance.
+        #
+        # 5 attempts × 5 s = up to 25 s of grace before the validation steps
+        # run. Independent of network exposure, so this works for dev,
+        # staging, and prod alike.
+        run: |
+          WEBAPP_ID=$(az webapp show \
+            --resource-group "${{ vars.AZURE_RESOURCE_GROUP }}" \
+            --name            "${{ vars.AZURE_WEBAPP_NAME }}" \
+            --query id -o tsv)
+
+          for i in 1 2 3 4 5; do
+            STATES=$(az rest --method GET \
+              --uri "https://management.azure.com${WEBAPP_ID}/instances?api-version=2024-04-01" \
+              --query "value[].properties.state" -o tsv 2>/dev/null || echo "")
+            TOTAL=$(echo "$STATES" | grep -c .)
+            READY=$(echo "$STATES" | grep -c '^READY$' || true)
+            echo "  attempt ${i}: ${READY}/${TOTAL} instance(s) READY"
+            if [[ "$TOTAL" -gt 0 && "$READY" -eq "$TOTAL" ]]; then
+              echo "All instances are healthy."
+              exit 0
+            fi
+            sleep 5
+          done
+
+          echo "::error::App Service did not reach healthy state after 5 attempts (25 s)."
+          exit 1
+
       # -----------------------------------------------------------------------
       # Validation strategy differs by environment network exposure:
       #
