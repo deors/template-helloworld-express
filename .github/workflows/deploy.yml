@@ -117,7 +117,7 @@ jobs:
             || { echo "::error::App not Running (state=${STATE})"; exit 1; }
 
           echo "=== Deployed image tag ==="
-          IMG=$(az webapp config container show \
+          IMG=$(az webapp config show \
             --resource-group "${{ vars.AZURE_RESOURCE_GROUP }}" \
             --name            "${{ vars.AZURE_WEBAPP_NAME }}" \
             --query linuxFxVersion -o tsv)

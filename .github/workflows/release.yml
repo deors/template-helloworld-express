@@ -95,7 +95,7 @@ jobs:
       - name: Read current image from dev Web App
         id: image
         run: |
-          RAW=$(az webapp config container show \
+          RAW=$(az webapp config show \
             --resource-group "${{ vars.AZURE_RESOURCE_GROUP }}" \
             --name            "${{ vars.AZURE_WEBAPP_NAME }}" \
             --query linuxFxVersion -o tsv)
