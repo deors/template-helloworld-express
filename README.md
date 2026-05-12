@@ -394,7 +394,9 @@ recent `main` push.
 ├── Dockerfile
 ├── .dockerignore
 ├── .gitignore
-├── package.json
+├── LICENSE
+├── package.json          # Runtime deps + npm scripts (start, test)
+├── package-lock.json     # Locked dep tree (committed; npm ci uses it)
 └── README.md
 ```
 
