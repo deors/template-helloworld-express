@@ -69,7 +69,9 @@ docker run --rm -p 8080:8080 \
 
 ### `ci.yml` — Continuous Integration
 
-Triggered by `push` on `main` and `workflow_dispatch` (the platform's bootstrap dispatch).
+Triggered by `push` on `main` (auto-fired by the initial commit GitHub
+creates when template-generating this repo, which is what the platform's
+`observe-ci` job watches), and by `workflow_dispatch` for ad-hoc re-runs.
 
 ```
 push / workflow_dispatch
@@ -196,7 +198,7 @@ The per-repo PUT is the recommended path for fully automated provisioning becaus
 it doesn't rely on an org-wide default that could be changed by accident — but
 both work.
 
-### 2. OIDC federated credentials
+### 2. OIDC federated credentials — handled automatically
 
 The platform workflow creates the service principal and its initial federated credentials scoped to the **platform repo**. For `deploy.yml` to authenticate from the **new app repo**, the same SP needs an additional federated credential per environment:
 
@@ -205,6 +207,14 @@ The platform workflow creates the service principal and its initial federated cr
 | `dev` | `repo:<org>/<app-repo>:environment:dev` |
 | `staging` | `repo:<org>/<app-repo>:environment:staging` |
 | `prod` | `repo:<org>/<app-repo>:environment:prod` |
+
+**The platform workflow registers all three for you** (see its
+`configure-federated-credentials` matrix job). No operator action is required
+on the happy path.
+
+If you ever need to add them by hand — for example to authorise an
+out-of-band branch or fork that the platform didn't provision — the snippets
+below are the same calls the workflow makes.
 
 **How to add (Azure Portal)**
 
@@ -229,9 +239,12 @@ for ENV in dev staging prod; do
 done
 ```
 
-> **Future automation**: adding these federated credentials is a candidate for the platform workflow to perform automatically at provision time.
+> **Prerequisite for the automated path:** the platform SP must be an owner
+> of its own App Registration **and** hold the Microsoft Graph
+> `Application.ReadWrite.OwnedBy` application permission (admin-consented).
+> See the platform repo's `docs/SETUP.md` step 5 for the one-time setup.
 
-### 2. GHCR package must not already exist under a different repo
+### 3. GHCR package must not already exist under a different repo
 
 GHCR ties each package permanently to the repository that first created it. If a
 package named `ghcr.io/<owner>/<app>` already exists — for example from an earlier
@@ -247,7 +260,7 @@ first:
 
 Go to **Package settings → Delete this package** before triggering `ci.yml`.
 
-### 3. GHCR package visibility and App Service pull access
+### 4. GHCR package visibility and App Service pull access
 
 GHCR creates packages as **private** on the first push. App Service has no registry
 credentials by default and cannot pull a private image, causing
@@ -356,7 +369,7 @@ This is the recommended path for any workload moving beyond the workshop stage.
 
 | Scenario | Tags produced |
 |----------|---------------|
-| Push to `main` / bootstrap dispatch | `sha-<7-char-sha>`, `latest` |
+| Push to `main` (incl. the template-generation initial commit) | `sha-<7-char-sha>`, `latest` |
 | Release candidate (`X.Y.Z-RC`) | `sha-<7-char-sha>` *(existing)* + `X.Y.Z-RC` |
 | GA release (`X.Y.Z`) | `sha-<7-char-sha>` *(existing)* + `X.Y.Z` |
 
