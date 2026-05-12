@@ -1,11 +1,13 @@
 name: Release
 
+run-name: Release ${{ github.event.release.tag_name || inputs.release_tag }}
+
 # Triggered automatically when a GitHub Release is created.
 # workflow_dispatch is provided for testing without creating a real release.
 #
 # Release tag naming rules:
-#   X.Y.Z        → deploy to prod   (GA release)
-#   X.Y.Z-RC     → deploy to staging (release candidate)
+#   X.Y.Z        → deploy to prod    (GA release;  image sourced from staging)
+#   X.Y.Z-RC     → deploy to staging (RC;           image sourced from dev)
 #   v prefix is accepted: v1.2.3, v1.2.3-RC
 #   Any other format fails the workflow immediately.
 
@@ -36,6 +38,7 @@ jobs:
     outputs:
       release_tag: ${{ steps.parse.outputs.release_tag }}
       target_env:  ${{ steps.parse.outputs.target_env }}
+      source_env:  ${{ steps.parse.outputs.source_env }}
 
     steps:
       - name: Parse and validate release tag
@@ -53,10 +56,12 @@ jobs:
 
           if [[ "${CLEAN}" =~ ^[0-9]+\.[0-9]+\.[0-9]+-RC$ ]]; then
             TARGET_ENV="staging"
-            echo "Release candidate → target: staging"
+            SOURCE_ENV="dev"
+            echo "Release candidate → target: staging (image sourced from dev)"
           elif [[ "${CLEAN}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
             TARGET_ENV="prod"
-            echo "GA release → target: prod"
+            SOURCE_ENV="staging"
+            echo "GA release → target: prod (image sourced from staging)"
           else
             echo "::error::Invalid release tag '${TAG}'." \
               "Expected X.Y.Z (prod) or X.Y.Z-RC (staging), with optional v prefix."
@@ -66,17 +71,19 @@ jobs:
           {
             echo "release_tag=${TAG}"
             echo "target_env=${TARGET_ENV}"
+            echo "source_env=${SOURCE_ENV}"
           } >> "$GITHUB_OUTPUT"
 
   # ---------------------------------------------------------------------------
-  # 2. Query the dev Web App to find the sha-* image tag currently running.
-  #    Uses the dev GitHub Environment so OIDC auth targets the dev SP.
+  # 2. Query the source environment Web App to find the sha-* image tag
+  #    currently running.  Source env is dev for RC releases, staging for GA.
+  #    Uses the matching GitHub Environment so OIDC auth targets the right SP.
   # ---------------------------------------------------------------------------
   identify-image:
-    name: Identify image deployed to dev
+    name: Identify image deployed to ${{ needs.validate.outputs.source_env }}
     needs: validate
     runs-on: ubuntu-latest
-    environment: dev
+    environment: ${{ needs.validate.outputs.source_env }}
     permissions:
       id-token: write
       contents: read
@@ -92,7 +99,7 @@ jobs:
           tenant-id:       ${{ vars.AZURE_TENANT_ID }}
           subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
 
-      - name: Read current image from dev Web App
+      - name: Read current image from ${{ needs.validate.outputs.source_env }} Web App
         id: image
         run: |
           RAW=$(az webapp config show \
@@ -108,8 +115,8 @@ jobs:
           SHA_TAG="${FULL##*:}"
 
           if [[ "${IMAGE_BASE}" != ghcr.io/* ]]; then
-            echo "::error::Dev Web App is not running a GHCR image (got: ${IMAGE_BASE})." \
-              "Run ci.yml successfully before creating a release."
+            echo "::error::${{ needs.validate.outputs.source_env }} Web App is not running a GHCR image (got: ${IMAGE_BASE})." \
+              "Ensure the source environment was deployed successfully before creating a release."
             exit 1
           fi
 
