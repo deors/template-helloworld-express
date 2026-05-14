@@ -319,15 +319,31 @@ For a workshop using a public repository, making the container image public is t
 right trade-off: the source code is already open, so the built artefact being
 publicly pullable adds no meaningful exposure.
 
-`ci.yml` handles this automatically: immediately after pushing, it calls the GitHub
-API to set the package visibility to **public**. No manual action is needed on the
-happy path.
+`ci.yml` attempts to set visibility to public automatically after each push, but
+this requires a **`PACKAGES_TOKEN`** repository secret — a classic PAT with the
+`write:packages` scope created by the owner of the GHCR namespace.
 
-If the API call fails (it emits a `::warning::` rather than failing the run), set
-visibility manually:
+**Why `GITHUB_TOKEN` cannot do this:** `GITHUB_TOKEN` is a GitHub App installation
+token (`ghs_*`) whose `/user` identity resolves to `github-actions[bot]`, not the
+repo owner. The package-visibility write endpoint (`PATCH /user/packages/...`)
+operates on the *authenticated* user's packages, so it looks for
+`github-actions[bot]`'s packages and returns 404. This is a GitHub platform
+limitation with no workaround using `GITHUB_TOKEN`.
+
+**To enable automatic visibility management:**
+
+1. Create a classic PAT at **GitHub → Settings → Developer settings → Personal
+   access tokens → Tokens (classic)** with the `write:packages` scope.
+2. Add it as a repository secret named **`PACKAGES_TOKEN`** in the app repo
+   (**Settings → Secrets and variables → Actions → New repository secret**).
+
+If `PACKAGES_TOKEN` is absent, `ci.yml` emits a `::notice::` and the package must
+be set to public manually:
 
 - Organisation: `https://github.com/orgs/<org>/packages/container/<app>`
 - Personal account: `https://github.com/users/<user>/packages/container/<app>`
+
+Navigate to **Package settings → Change visibility → Public**.
 
 ---
 
