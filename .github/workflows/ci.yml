@@ -63,51 +63,16 @@ jobs:
             .
 
       - name: Push container image
+        # The package visibility is automatically inherited from the repository:
+        # a public repository produces a public package, a private repository
+        # produces a private package.
+        # App Service (which has no registry credentials) can pull the image as
+        # long as the repository — and therefore the package — is public.
+        # For private repositories use Strategy 2 (GHCR + credentials) or
+        # Strategy 3 (ACR + Managed Identity) as documented in the README.
         run: |
           docker push "${{ steps.meta.outputs.image_full }}"
           docker push "${{ steps.meta.outputs.image_base }}:latest"
-
-      - name: Set GHCR package visibility to public
-        # GHCR creates packages as private on first push. App Service has no
-        # registry credentials, so a private image causes ImagePullUnauthorizedFailure
-        # at startup.
-        #
-        # WHY GITHUB_TOKEN CANNOT DO THIS:
-        # GITHUB_TOKEN is a GitHub App installation token (ghs_*) whose /user identity
-        # resolves to github-actions[bot], not the repo owner. The package management
-        # write endpoint (PATCH /user/packages/...) operates on the *authenticated
-        # user's* packages, so it looks for github-actions[bot]'s packages and returns
-        # 404. There is no workaround — a token that authenticates as the actual owner
-        # is required.
-        #
-        # PACKAGES_TOKEN must be a classic PAT (write:packages scope) created by the
-        # owner of the GHCR namespace (github.repository_owner). Store it as a
-        # repository secret named PACKAGES_TOKEN. If absent, a notice is emitted and
-        # the package must be made public manually.
-        env:
-          GH_TOKEN: ${{ secrets.PACKAGES_TOKEN }}
-        run: |
-          if [ -z "${GH_TOKEN}" ]; then
-            echo "::notice::PACKAGES_TOKEN secret is not set — cannot set package visibility automatically."
-            echo "::notice::Go to github.com/${{ github.repository_owner }} → Packages → ${{ github.event.repository.name }} → Package settings and set visibility to Public manually."
-            exit 0
-          fi
-
-          OWNER="${{ github.repository_owner }}"
-          REPO="${{ github.event.repository.name }}"
-
-          OWNER_TYPE=$(gh api "/users/${OWNER}" --jq '.type' 2>/dev/null || echo "User")
-          echo "Account type: ${OWNER_TYPE}"
-
-          if [ "${OWNER_TYPE}" = "Organization" ]; then
-            ENDPOINT="/orgs/${OWNER}/packages/container/${REPO}"
-          else
-            ENDPOINT="/user/packages/container/${REPO}"
-          fi
-
-          gh api --method PATCH "${ENDPOINT}" -f visibility=public \
-            && echo "Package set to public — App Service can pull without credentials." \
-            || echo "::warning::Could not set package visibility. Go to github.com/${OWNER} → Packages → ${REPO} → Package settings and set visibility to Public manually."
 
   deploy-dev:
     name: Deploy to dev
