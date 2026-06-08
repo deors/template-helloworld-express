@@ -73,8 +73,8 @@ jobs:
         # the App Service signal that the new container has replaced the
         # previous one on that instance.
         #
-        # 10 attempts × 5 s = up to 50 s of grace before the validation steps
-        # run. Independent of network exposure, so this works for dev,
+        # 12 attempts × 10 s = up to 120 s of grace before the validation
+        # steps run. Independent of network exposure, so this works for dev,
         # staging, and prod alike.
         run: |
           WEBAPP_ID=$(az webapp show \
@@ -82,7 +82,7 @@ jobs:
             --name            "${{ vars.AZURE_WEBAPP_NAME }}" \
             --query id -o tsv)
 
-          for i in 1 2 3 4 5 6 7 8 9 10; do
+          for i in 1 2 3 4 5 6 7 8 9 10 11 12; do
             STATES=$(az rest --method GET \
               --uri "https://management.azure.com${WEBAPP_ID}/instances?api-version=2024-04-01" \
               --query "value[].properties.state" -o tsv 2>/dev/null || echo "")
@@ -93,10 +93,10 @@ jobs:
               echo "All instances are healthy."
               exit 0
             fi
-            sleep 5
+            sleep 10
           done
 
-          echo "::error::App Service did not reach healthy state after 10 attempts (50 s)."
+          echo "::error::App Service did not reach healthy state after 12 attempts (120 s)."
           exit 1
 
       # -----------------------------------------------------------------------
