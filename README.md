@@ -73,7 +73,7 @@ Triggered by `push` on `main` (auto-fired by the initial commit GitHub
 creates when template-generating this repo, which is what the platform's
 `observe-ci` job watches), and by `workflow_dispatch` for ad-hoc re-runs.
 
-```
+``` text
 push / workflow_dispatch
   └─ build-test-push
         ├─ npm ci && npm test
@@ -89,7 +89,7 @@ The entire run — including the dev deploy — must be green for the platform t
 
 Triggered when a **GitHub Release is created**. Also has a `workflow_dispatch` trigger for testing without creating a real release.
 
-```
+``` text
 release created / workflow_dispatch
   └─ validate
         └─ parse tag → determine target environment
@@ -267,11 +267,13 @@ done
 >
 > 1. The platform service principal must be added as an **owner** of its
 >    own App Registration:
+>
 >    ```bash
 >    APP_OBJECT_ID=$(az ad app show --id "$CLIENT_ID" --query id -o tsv)
 >    SP_OBJECT_ID=$(az ad sp show --id "$CLIENT_ID" --query id -o tsv)
 >    az ad app owner add --id "$APP_OBJECT_ID" --owner-object-id "$SP_OBJECT_ID"
 >    ```
+>
 >    Ownership alone covers user-delegated flows, but not the
 >    application-only flow a workflow's OIDC token runs under.
 >
@@ -346,6 +348,7 @@ PATs do not support GHCR). App Service persists the credentials and uses them fo
 every subsequent pull — restarts, scale-out, slot swaps.
 
 **Downsides to be aware of:**
+
 - Classic PATs are long-lived and do not rotate automatically; a rotation process
   must be put in place.
 - The credential is stored in plain text in the App Service configuration unless
@@ -372,18 +375,20 @@ The workflow change is small: replace the `docker login ghcr.io` / `docker push`
 steps with `az acr login` (authenticated via OIDC, same as the rest of the deploy)
 and push to `<registry>.azurecr.io/<app>:<tag>` instead.
 
-```
+``` text
 ci.yml: build → az acr login → docker push <acr>/<app>:<tag>
 deploy.yml: az webapp config container set → <acr>/<app>:<tag>  (no --registry-* flags needed)
 ```
 
 **What changes on the platform side:**
+
 - Terraform provisions an ACR resource and a role assignment (`AcrPull`) linking the
   Web App's managed identity to the ACR.
 - The `AZURE_REGISTRY_NAME` (e.g. `crMyAppDev`) is added as a per-environment
   GitHub variable alongside the existing ones.
 
 **Benefits over strategies 1 and 2:**
+
 - Zero credentials in the pipeline or in App Service configuration.
 - The MI token is managed by Azure and never expires.
 - Works equally well for dev, staging, and prod with no changes to the workflow.
@@ -422,7 +427,7 @@ recent `main` push.
 
 ## Repo structure
 
-```
+``` text
 .
 ├── src/
 │   ├── index.js          # Express app
