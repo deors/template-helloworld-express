@@ -100,7 +100,7 @@ release created / workflow_dispatch
   └─ deploy  (calls deploy.yml with target environment + release tag)
 ```
 
-**Release tag naming rules**
+#### Release tag naming rules
 
 | Tag format | Example | Target |
 |------------|---------|--------|
@@ -109,7 +109,7 @@ release created / workflow_dispatch
 | `vX.Y.Z` / `vX.Y.Z-RC` | `v1.4.0-RC` | same as above, `v` prefix accepted |
 | Any other format | `1.4.0-beta` | workflow fails immediately |
 
-**Image tagging strategy**
+#### Image tagging strategy
 
 The workflow does not build a new image. It reads the `sha-*` tag currently deployed to dev (via `az webapp config show`), adds the release version as a second tag to the same image digest in GHCR, and deploys that tag to the target environment. At any point in time the same image may carry multiple tags:
 
@@ -123,14 +123,14 @@ The workflow does not build a new image. It reads the `sha-*` tag currently depl
 
 Reusable workflow (`workflow_call`). Called by `ci.yml` for dev on every push and by `release.yml` for staging/prod promotions.
 
-**Inputs**
+#### Inputs
 
 | Input | Type | Description |
 |-------|------|-------------|
 | `environment` | string | `dev`, `staging`, or `prod` |
 | `image_tag` | string | Tag to deploy, e.g. `sha-abc1234` |
 
-**GitHub Environment variables consumed** (set by the platform workflow)
+#### GitHub Environment variables consumed (set by the platform workflow)
 
 | Variable | Example |
 |----------|---------|
@@ -140,7 +140,7 @@ Reusable workflow (`workflow_call`). Called by `ci.yml` for dev on every push an
 | `AZURE_RESOURCE_GROUP` | `rg-myapp-dev` |
 | `AZURE_WEBAPP_NAME` | `app-myapp-dev` |
 
-**Deploy steps** (in this order)
+#### Deploy steps (in this order)
 
 1. OIDC login via `azure/login@v3` using the variables above.
 2. `az webapp config appsettings set` — injects `APP_NAME`, `APP_ENV`,
@@ -158,7 +158,7 @@ Reusable workflow (`workflow_call`). Called by `ci.yml` for dev on every push an
 5. Validation — strategy depends on the environment's network exposure (see
    below).
 
-**Deploy validation strategy**
+#### Deploy validation strategy
 
 The platform provisions environments with different network exposure:
 
@@ -239,12 +239,12 @@ If you ever need to add them by hand — for example to authorise an
 out-of-band branch or fork that the platform didn't provision — the snippets
 below are the same calls the workflow makes.
 
-**How to add (Azure Portal)**
+#### How to add (Azure Portal)
 
 1. Open the service principal → **Certificates & secrets** → **Federated credentials**.
 2. Add a credential for each environment using the subject format above.
 
-**How to add (CLI)**
+#### How to add (CLI)
 
 ```bash
 APP_REPO="my-org/my-app"
@@ -399,7 +399,7 @@ This is the recommended path for any workload moving beyond the workshop stage.
 
 ---
 
-**Summary**
+#### Summary
 
 | | Public GHCR | Private GHCR + PAT | ACR + MI |
 |---|---|---|---|
