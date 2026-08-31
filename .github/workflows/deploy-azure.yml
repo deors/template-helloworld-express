@@ -26,6 +26,32 @@ jobs:
       contents: read
 
     steps:
+      - name: Preflight – validate required configuration
+        # Fails fast, before login or any mutation, naming every missing item.
+        # All values are GitHub Environment variables expected to be
+        # configured by the orchestrator for the target environment.
+        env:
+          AZURE_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
+          AZURE_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+          AZURE_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+          AZURE_RESOURCE_GROUP: ${{ vars.AZURE_RESOURCE_GROUP }}
+          AZURE_WEBAPP_NAME: ${{ vars.AZURE_WEBAPP_NAME }}
+        run: |
+          MISSING=()
+          for VAR in AZURE_CLIENT_ID AZURE_TENANT_ID AZURE_SUBSCRIPTION_ID \
+                     AZURE_RESOURCE_GROUP AZURE_WEBAPP_NAME; do
+            [ -n "${!VAR}" ] || MISSING+=("${VAR}")
+          done
+
+          if [ "${#MISSING[@]}" -gt 0 ]; then
+            echo "::error::Missing required variable(s) for environment" \
+              "'${{ inputs.environment }}': ${MISSING[*]}. Configure them as" \
+              "GitHub Environment variables for this environment."
+            exit 1
+          fi
+
+          echo "Preflight OK: all required variables are set."
+
       - name: Checkout
         uses: actions/checkout@v6
 
