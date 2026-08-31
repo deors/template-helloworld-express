@@ -1,8 +1,16 @@
 name: Deploy / AWS
 
-# Placeholder for the AWS-specific deployment reusable workflow (issue H03).
-# It exposes the shared workflow_call contract so the deploy.yml router can
-# reference it, and fails fast until the real implementation lands.
+# AWS-specific deployment reusable workflow (ECS Fargate). Invoked by the
+# deploy.yml cloud router — do not call directly from CI or release workflows.
+#
+# Required GitHub Environment variables, configured by the orchestrator for
+# the target environment (alongside the other cloud parameters):
+#   AWS_ROLE_ARN     — IAM role assumed via OIDC (no long-lived keys)
+#   AWS_REGION       — target AWS region
+#   AWS_ECS_CLUSTER  — ECS cluster name
+#   AWS_ECS_SERVICE  — ECS service name
+#   AWS_APP_URL      — public base URL of the app; required for dev only,
+#                      where the HTTP smoke test runs
 
 on:
   workflow_call:
@@ -20,11 +28,188 @@ jobs:
   deploy:
     name: Deploy ${{ inputs.image_tag }} → ${{ inputs.environment }}
     runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+
+    permissions:
+      id-token: write
+      contents: read
 
     steps:
-      - name: Not implemented
+      - name: Preflight – validate required configuration
+        # Fails fast, before login or any mutation, naming every missing item.
+        env:
+          AWS_ROLE_ARN: ${{ vars.AWS_ROLE_ARN }}
+          AWS_REGION: ${{ vars.AWS_REGION }}
+          AWS_ECS_CLUSTER: ${{ vars.AWS_ECS_CLUSTER }}
+          AWS_ECS_SERVICE: ${{ vars.AWS_ECS_SERVICE }}
+          AWS_APP_URL: ${{ vars.AWS_APP_URL }}
         run: |
-          echo "::error::AWS deployment is not implemented yet — tracked in" \
-            "issue H03 (deors/template-helloworld-express#3). Select another" \
-            "cloud or wait for deploy-aws.yml to be implemented."
+          REQUIRED=(AWS_ROLE_ARN AWS_REGION AWS_ECS_CLUSTER AWS_ECS_SERVICE)
+          # The public URL is only consumed by the dev HTTP smoke test;
+          # staging/prod are validated via the control plane.
+          if [ "${{ inputs.environment }}" = "dev" ]; then
+            REQUIRED+=(AWS_APP_URL)
+          fi
+
+          MISSING=()
+          for VAR in "${REQUIRED[@]}"; do
+            [ -n "${!VAR}" ] || MISSING+=("${VAR}")
+          done
+
+          if [ "${#MISSING[@]}" -gt 0 ]; then
+            echo "::error::Missing required variable(s) for environment" \
+              "'${{ inputs.environment }}': ${MISSING[*]}. Configure them as" \
+              "GitHub Environment variables for this environment."
+            exit 1
+          fi
+
+          echo "Preflight OK: all required variables are set."
+
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Resolve image reference
+        id: image
+        run: |
+          OWNER=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
+          # $GITHUB_REPOSITORY is always owner/repo — reliable in reusable workflows
+          # unlike github.event.repository.name which is empty under workflow_call.
+          REPO=$(echo "${GITHUB_REPOSITORY##*/}" | tr '[:upper:]' '[:lower:]')
+          echo "ref=ghcr.io/${OWNER}/${REPO}:${{ inputs.image_tag }}" >> "$GITHUB_OUTPUT"
+          echo "app_name=${GITHUB_REPOSITORY##*/}" >> "$GITHUB_OUTPUT"
+
+      - name: Register task definition revision
+        # A single-container task is assumed (this template's app). Image and
+        # runtime env vars (APP_NAME / APP_ENV / IMAGE_TAG) land atomically in
+        # the same revision, so the new container always starts with the
+        # correct configuration — the ECS equivalent of the Azure flow where
+        # app settings must be applied before the container image swap.
+        id: taskdef
+        run: |
+          CURRENT_ARN=$(aws ecs describe-services \
+            --cluster  "${{ vars.AWS_ECS_CLUSTER }}" \
+            --services "${{ vars.AWS_ECS_SERVICE }}" \
+            --query 'services[0].taskDefinition' --output text)
+          echo "Current task definition: ${CURRENT_ARN}"
+
+          aws ecs describe-task-definition \
+            --task-definition "${CURRENT_ARN}" \
+            --query taskDefinition > current-task-def.json
+
+          jq \
+            --arg IMAGE     "${{ steps.image.outputs.ref }}" \
+            --arg APP_NAME  "${{ steps.image.outputs.app_name }}" \
+            --arg APP_ENV   "${{ inputs.environment }}" \
+            --arg IMAGE_TAG "${{ inputs.image_tag }}" \
+            '
+            .containerDefinitions[0].image = $IMAGE
+            | .containerDefinitions[0].environment =
+                ((.containerDefinitions[0].environment // [])
+                 | map(select(.name | IN("APP_NAME", "APP_ENV", "IMAGE_TAG") | not))
+                 + [{name: "APP_NAME",  value: $APP_NAME},
+                    {name: "APP_ENV",   value: $APP_ENV},
+                    {name: "IMAGE_TAG", value: $IMAGE_TAG}])
+            # Strip read-only fields the register API rejects.
+            | del(.taskDefinitionArn, .revision, .status, .requiresAttributes,
+                  .compatibilities, .registeredAt, .registeredBy)
+            ' current-task-def.json > new-task-def.json
+
+          NEW_ARN=$(aws ecs register-task-definition \
+            --cli-input-json file://new-task-def.json \
+            --query 'taskDefinition.taskDefinitionArn' --output text)
+          echo "New task definition: ${NEW_ARN}"
+          echo "arn=${NEW_ARN}" >> "$GITHUB_OUTPUT"
+
+      - name: Update ECS service
+        run: |
+          aws ecs update-service \
+            --cluster         "${{ vars.AWS_ECS_CLUSTER }}" \
+            --service         "${{ vars.AWS_ECS_SERVICE }}" \
+            --task-definition "${{ steps.taskdef.outputs.arn }}" \
+            --query 'service.serviceName' --output text
+
+      - name: Wait for service to reach steady state
+        # Polls the service until the new deployment settles (new tasks
+        # running and healthy, old tasks drained). The waiter checks every
+        # 15 s up to 40 times (~10 min) and fails the job on timeout.
+        run: |
+          aws ecs wait services-stable \
+            --cluster  "${{ vars.AWS_ECS_CLUSTER }}" \
+            --services "${{ vars.AWS_ECS_SERVICE }}"
+          echo "Service reached steady state."
+
+      # -----------------------------------------------------------------------
+      # Validation strategy differs by environment network exposure, mirroring
+      # the Azure workflow:
+      #
+      #   dev     — public endpoint is open. Poll /health over HTTPS from the
+      #             runner using AWS_APP_URL.
+      #
+      #   staging / prod — private-only ingress. The endpoint is unreachable
+      #             from GitHub-hosted runners, so control-plane assertions are
+      #             used instead:
+      #               • service status is ACTIVE and the primary deployment
+      #                 rollout is COMPLETED with all tasks running
+      #               • the service's task definition runs the expected image tag
+      # -----------------------------------------------------------------------
+
+      - name: Validate – HTTP smoke test (dev)
+        if: inputs.environment == 'dev'
+        run: |
+          APP_URL="${{ vars.AWS_APP_URL }}"
+          echo "Smoke-testing ${APP_URL}/health …"
+
+          for i in $(seq 1 18); do
+            STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+              --max-time 10 \
+              "${APP_URL}/health" || echo "000")
+            echo "  attempt ${i}: HTTP ${STATUS}"
+            if [ "${STATUS}" = "200" ]; then
+              echo "Health check passed."
+              exit 0
+            fi
+            sleep 10
+          done
+
+          echo "Health check timed out after 3 minutes."
           exit 1
+
+      - name: Validate – control-plane assertions (staging / prod)
+        if: inputs.environment != 'dev'
+        run: |
+          echo "=== Service state ==="
+          read -r STATUS ROLLOUT RUNNING DESIRED TASKDEF <<<"$(aws ecs describe-services \
+            --cluster  "${{ vars.AWS_ECS_CLUSTER }}" \
+            --services "${{ vars.AWS_ECS_SERVICE }}" \
+            --query 'services[0].[status, deployments[?status==`PRIMARY`]|[0].rolloutState, runningCount, desiredCount, taskDefinition]' \
+            --output text)"
+          echo "Status: ${STATUS} | Rollout: ${ROLLOUT} | Tasks: ${RUNNING}/${DESIRED}"
+
+          [[ "${STATUS}" == "ACTIVE" ]] \
+            || { echo "::error::Service not ACTIVE (status=${STATUS})"; exit 1; }
+          [[ "${ROLLOUT}" == "COMPLETED" ]] \
+            || { echo "::error::Primary deployment rollout not COMPLETED (state=${ROLLOUT})"; exit 1; }
+          [[ "${RUNNING}" -gt 0 && "${RUNNING}" -eq "${DESIRED}" ]] \
+            || { echo "::error::Running tasks (${RUNNING}) do not match desired (${DESIRED})"; exit 1; }
+
+          echo "=== Deployed image tag ==="
+          IMG=$(aws ecs describe-task-definition \
+            --task-definition "${TASKDEF}" \
+            --query 'taskDefinition.containerDefinitions[0].image' --output text)
+          echo "Image: ${IMG}"
+          grep -q "${{ inputs.image_tag }}" <<<"${IMG}" \
+            || { echo "::error::Deployed image (${IMG}) does not contain expected tag (${{ inputs.image_tag }})"; exit 1; }
+
+          echo "Control-plane validation passed."
+
+      - name: Confirm deployed version
+        run: |
+          echo "Deployed image   : ${{ steps.image.outputs.ref }}"
+          echo "Task definition  : ${{ steps.taskdef.outputs.arn }}"
+          echo "Cluster / service: ${{ vars.AWS_ECS_CLUSTER }} / ${{ vars.AWS_ECS_SERVICE }}"
