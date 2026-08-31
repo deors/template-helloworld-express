@@ -1,0 +1,30 @@
+name: Deploy / AWS
+
+# Placeholder for the AWS-specific deployment reusable workflow (issue H03).
+# It exposes the shared workflow_call contract so the deploy.yml router can
+# reference it, and fails fast until the real implementation lands.
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        description: Target environment (dev | staging | prod)
+        type: string
+        required: true
+      image_tag:
+        description: Container image tag to deploy (e.g. sha-abc1234)
+        type: string
+        required: true
+
+jobs:
+  deploy:
+    name: Deploy ${{ inputs.image_tag }} → ${{ inputs.environment }}
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Not implemented
+        run: |
+          echo "::error::AWS deployment is not implemented yet — tracked in" \
+            "issue H03 (deors/template-helloworld-express#3). Select another" \
+            "cloud or wait for deploy-aws.yml to be implemented."
+          exit 1

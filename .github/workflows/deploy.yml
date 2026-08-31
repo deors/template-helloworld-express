@@ -1,5 +1,18 @@
 name: Deploy
 
+# Cloud-agnostic deploy router. Resolves the target cloud and delegates the
+# deployment to the matching cloud-specific reusable workflow. This file must
+# not contain any cloud-provider deployment commands.
+#
+# Cloud resolution precedence:
+#   1. workflow_dispatch input `cloud` (manual runs — always required)
+#   2. workflow_call input `cloud` (when the caller provides it)
+#   3. repository variable DEPLOY_TARGET_CLOUD (fallback for CI/release calls)
+#
+# Note: `uses:` references to reusable workflows are resolved when the run
+# starts, even for jobs skipped by their `if:` condition — so the three
+# cloud workflow files must always exist.
+
 on:
   workflow_call:
     inputs:
@@ -11,158 +24,105 @@ on:
         description: Container image tag to deploy (e.g. sha-abc1234)
         type: string
         required: true
+      cloud:
+        description: >
+          Target cloud (azure | aws | gcp). When omitted, resolved from the
+          DEPLOY_TARGET_CLOUD repository variable.
+        type: string
+        required: false
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Target environment
+        type: choice
+        options: [dev, staging, prod]
+        required: true
+      image_tag:
+        description: Container image tag to deploy (e.g. sha-abc1234)
+        type: string
+        required: true
+      cloud:
+        description: Target cloud
+        type: choice
+        options: [azure, aws, gcp]
+        required: true
 
 jobs:
-  deploy:
-    name: Deploy ${{ inputs.image_tag }} → ${{ inputs.environment }}
-    runs-on: ubuntu-latest
-    environment: ${{ inputs.environment }}
 
+  resolve-cloud:
+    name: Resolve target cloud
+    runs-on: ubuntu-latest
+    outputs:
+      cloud: ${{ steps.resolve.outputs.cloud }}
+
+    steps:
+      - name: Resolve and validate target cloud
+        id: resolve
+        run: |
+          # Explicit input wins (workflow_dispatch makes it mandatory, so on
+          # manual runs it is always present); repository variable is the
+          # fallback for workflow_call invocations that omit it.
+          CLOUD="${{ inputs.cloud }}"
+          SOURCE="workflow input 'cloud'"
+          if [ -z "${CLOUD}" ]; then
+            CLOUD="${{ vars.DEPLOY_TARGET_CLOUD }}"
+            SOURCE="repository variable DEPLOY_TARGET_CLOUD"
+          fi
+
+          if [ -z "${CLOUD}" ]; then
+            echo "::error::No target cloud resolved." \
+              "Pass the 'cloud' input (azure | aws | gcp) or set the" \
+              "DEPLOY_TARGET_CLOUD repository variable."
+            exit 1
+          fi
+
+          case "${CLOUD}" in
+            azure|aws|gcp)
+              echo "Target cloud: ${CLOUD} (from ${SOURCE})"
+              echo "cloud=${CLOUD}" >> "$GITHUB_OUTPUT"
+              ;;
+            *)
+              echo "::error::Invalid target cloud '${CLOUD}' (from ${SOURCE})." \
+                "Allowed values: azure | aws | gcp."
+              exit 1
+              ;;
+          esac
+
+  deploy-azure:
+    name: Deploy on Azure
+    needs: resolve-cloud
+    if: needs.resolve-cloud.outputs.cloud == 'azure'
     permissions:
       id-token: write
       contents: read
+    uses: ./.github/workflows/deploy-azure.yml
+    with:
+      environment: ${{ inputs.environment }}
+      image_tag: ${{ inputs.image_tag }}
+    secrets: inherit
 
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v6
+  deploy-aws:
+    name: Deploy on AWS
+    needs: resolve-cloud
+    if: needs.resolve-cloud.outputs.cloud == 'aws'
+    permissions:
+      id-token: write
+      contents: read
+    uses: ./.github/workflows/deploy-aws.yml
+    with:
+      environment: ${{ inputs.environment }}
+      image_tag: ${{ inputs.image_tag }}
+    secrets: inherit
 
-      - name: Azure login (OIDC)
-        uses: azure/login@v3
-        with:
-          client-id: ${{ vars.AZURE_CLIENT_ID }}
-          tenant-id: ${{ vars.AZURE_TENANT_ID }}
-          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
-
-      - name: Resolve image reference
-        id: image
-        run: |
-          OWNER=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
-          # $GITHUB_REPOSITORY is always owner/repo — reliable in reusable workflows
-          # unlike github.event.repository.name which is empty under workflow_call.
-          REPO=$(echo "${GITHUB_REPOSITORY##*/}" | tr '[:upper:]' '[:lower:]')
-          echo "ref=ghcr.io/${OWNER}/${REPO}:${{ inputs.image_tag }}" >> "$GITHUB_OUTPUT"
-          echo "app_name=${GITHUB_REPOSITORY##*/}" >> "$GITHUB_OUTPUT"
-
-      - name: Set runtime environment variables
-        # Must run BEFORE the container update so that when App Service restarts
-        # to pull the new image it already has the correct env vars in place.
-        run: |
-          az webapp config appsettings set \
-            --resource-group "${{ vars.AZURE_RESOURCE_GROUP }}" \
-            --name            "${{ vars.AZURE_WEBAPP_NAME }}" \
-            --settings \
-              APP_NAME="${{ steps.image.outputs.app_name }}" \
-              APP_ENV="${{ inputs.environment }}" \
-              IMAGE_TAG="${{ inputs.image_tag }}"
-
-      - name: Update Web App container image
-        # Changing the image triggers an App Service restart automatically.
-        # Because app settings were applied in the previous step, the new
-        # container starts with all three env vars already present.
-        run: |
-          az webapp config container set \
-            --resource-group "${{ vars.AZURE_RESOURCE_GROUP }}" \
-            --name            "${{ vars.AZURE_WEBAPP_NAME }}" \
-            --container-image-name "${{ steps.image.outputs.ref }}"
-
-      - name: Wait for App Service to become healthy
-        # Container image swap is asynchronous: the Web App stays "Running"
-        # at the control-plane level, but the worker instances cycle as the
-        # new image is pulled and started. Poll the per-instance state via
-        # the ARM REST API until every instance reports `READY` — which is
-        # the App Service signal that the new container has replaced the
-        # previous one on that instance.
-        #
-        # 12 attempts × 10 s = up to 120 s of grace before the validation
-        # steps run. Independent of network exposure, so this works for dev,
-        # staging, and prod alike.
-        run: |
-          WEBAPP_ID=$(az webapp show \
-            --resource-group "${{ vars.AZURE_RESOURCE_GROUP }}" \
-            --name            "${{ vars.AZURE_WEBAPP_NAME }}" \
-            --query id -o tsv)
-
-          for i in 1 2 3 4 5 6 7 8 9 10 11 12; do
-            STATES=$(az rest --method GET \
-              --uri "https://management.azure.com${WEBAPP_ID}/instances?api-version=2024-04-01" \
-              --query "value[].properties.state" -o tsv 2>/dev/null || echo "")
-            TOTAL=$(echo "$STATES" | grep -c .)
-            READY=$(echo "$STATES" | grep -c '^READY$' || true)
-            echo "  attempt ${i}: ${READY}/${TOTAL} instance(s) READY"
-            if [[ "$TOTAL" -gt 0 && "$READY" -eq "$TOTAL" ]]; then
-              echo "All instances are healthy."
-              exit 0
-            fi
-            sleep 10
-          done
-
-          echo "::error::App Service did not reach healthy state after 12 attempts (120 s)."
-          exit 1
-
-      # -----------------------------------------------------------------------
-      # Validation strategy differs by environment network exposure:
-      #
-      #   dev     — public endpoint is open (public_network_access_enabled=true
-      #             in Terraform).  Poll /health over HTTPS from the runner.
-      #
-      #   staging / prod — private-endpoint-only (public_network_access_enabled
-      #             =false).  The public hostname is unreachable from GitHub-
-      #             hosted runners, so we use control-plane assertions instead:
-      #               • az webapp show          → App Service state == Running
-      #               • az webapp config show   → linuxFxVersion contains
-      #                                           the expected image tag
-      #
-      # To use HTTP validation against staging/prod, provision self-hosted
-      # runners inside the VNet and remove the environment condition below.
-      # -----------------------------------------------------------------------
-
-      - name: Validate – HTTP smoke test (dev)
-        if: inputs.environment == 'dev'
-        run: |
-          WEBAPP_URL="https://${{ vars.AZURE_WEBAPP_NAME }}.azurewebsites.net"
-          echo "Smoke-testing ${WEBAPP_URL}/health …"
-
-          for i in $(seq 1 18); do
-            STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
-              --max-time 10 \
-              "${WEBAPP_URL}/health" || echo "000")
-            echo "  attempt ${i}: HTTP ${STATUS}"
-            if [ "${STATUS}" = "200" ]; then
-              echo "Health check passed."
-              exit 0
-            fi
-            sleep 10
-          done
-
-          echo "Health check timed out after 3 minutes."
-          exit 1
-
-      - name: Validate – control-plane assertions (staging / prod)
-        if: inputs.environment != 'dev'
-        run: |
-          echo "=== App Service state ==="
-          STATE=$(az webapp show \
-            --resource-group "${{ vars.AZURE_RESOURCE_GROUP }}" \
-            --name            "${{ vars.AZURE_WEBAPP_NAME }}" \
-            --query state -o tsv)
-          echo "State: ${STATE}"
-          [[ "${STATE}" == "Running" ]] \
-            || { echo "::error::App not Running (state=${STATE})"; exit 1; }
-
-          echo "=== Deployed image tag ==="
-          IMG=$(az webapp config show \
-            --resource-group "${{ vars.AZURE_RESOURCE_GROUP }}" \
-            --name            "${{ vars.AZURE_WEBAPP_NAME }}" \
-            --query linuxFxVersion -o tsv)
-          echo "linuxFxVersion: ${IMG}"
-          grep -q "${{ inputs.image_tag }}" <<<"${IMG}" \
-            || { echo "::error::Deployed image (${IMG}) does not contain expected tag (${{ inputs.image_tag }})"; exit 1; }
-
-          echo "Control-plane validation passed."
-
-      - name: Confirm deployed version
-        run: |
-          WEBAPP_URL="https://${{ vars.AZURE_WEBAPP_NAME }}.azurewebsites.net"
-          echo "Deployed image : ${{ steps.image.outputs.ref }}"
-          echo "App URL        : ${WEBAPP_URL}"
-          echo "Whois endpoint : ${WEBAPP_URL}/whois"
+  deploy-gcp:
+    name: Deploy on GCP
+    needs: resolve-cloud
+    if: needs.resolve-cloud.outputs.cloud == 'gcp'
+    permissions:
+      id-token: write
+      contents: read
+    uses: ./.github/workflows/deploy-gcp.yml
+    with:
+      environment: ${{ inputs.environment }}
+      image_tag: ${{ inputs.image_tag }}
+    secrets: inherit
