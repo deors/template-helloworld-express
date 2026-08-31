@@ -138,11 +138,51 @@ jobs:
         # Polls the service until the new deployment settles (new tasks
         # running and healthy, old tasks drained). The waiter checks every
         # 15 s up to 40 times (~10 min) and fails the job on timeout.
+        id: wait
         run: |
           aws ecs wait services-stable \
             --cluster  "${{ vars.AWS_ECS_CLUSTER }}" \
             --services "${{ vars.AWS_ECS_SERVICE }}"
           echo "Service reached steady state."
+
+      - name: Diagnose failed deployment
+        # The waiter only reports a timeout; the reasons live in the service
+        # events and the stopped tasks. Surface them in the job log so a
+        # failed rollout (e.g. crash-looping tasks) is diagnosable without
+        # console access.
+        if: failure() && steps.wait.outcome == 'failure'
+        run: |
+          echo "::group::Deployments"
+          aws ecs describe-services \
+            --cluster  "${{ vars.AWS_ECS_CLUSTER }}" \
+            --services "${{ vars.AWS_ECS_SERVICE }}" \
+            --query 'services[0].deployments[].{status:status,taskDef:taskDefinition,rollout:rolloutState,reason:rolloutStateReason,failedTasks:failedTasks,running:runningCount,desired:desiredCount}' \
+            --output table
+          echo "::endgroup::"
+
+          echo "::group::Recent service events"
+          aws ecs describe-services \
+            --cluster  "${{ vars.AWS_ECS_CLUSTER }}" \
+            --services "${{ vars.AWS_ECS_SERVICE }}" \
+            --query 'services[0].events[0:10].message' --output table
+          echo "::endgroup::"
+
+          echo "::group::Stopped tasks (reasons and exit codes)"
+          for TASK in $(aws ecs list-tasks \
+              --cluster "${{ vars.AWS_ECS_CLUSTER }}" \
+              --desired-status STOPPED \
+              --query 'taskArns[0:5]' --output text); do
+            aws ecs describe-tasks \
+              --cluster "${{ vars.AWS_ECS_CLUSTER }}" --tasks "${TASK}" \
+              --query 'tasks[0].{taskDef:taskDefinitionArn,stoppedReason:stoppedReason,stopCode:stopCode,containers:containers[].{name:name,exitCode:exitCode,reason:reason}}' \
+              --output json || true
+          done
+          echo "::endgroup::"
+
+          echo "::error::Deployment did not stabilize. Review the deployments," \
+            "service events and stopped task reasons above (a crash-looping" \
+            "container usually means the runtime configuration — e.g. PORT —" \
+            "does not match the app's contract)."
 
       # -----------------------------------------------------------------------
       # Validation strategy differs by environment network exposure, mirroring
