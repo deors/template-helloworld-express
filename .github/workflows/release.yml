@@ -75,9 +75,12 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
   # ---------------------------------------------------------------------------
-  # 2. Query the source environment Web App to find the sha-* image tag
-  #    currently running.  Source env is dev for RC releases, staging for GA.
-  #    Uses the matching GitHub Environment so OIDC auth targets the right SP.
+  # 2. Query the source environment to find the sha-* image tag currently
+  #    running.  Source env is dev for RC releases, staging for GA.  The job
+  #    binds the matching GitHub Environment, resolves that environment's
+  #    cloud from DEPLOY_TARGET_CLOUD (same rule as the deploy.yml router),
+  #    and runs the read-only query for that cloud.  Each cloud read exports
+  #    IMAGE_REF; a final cloud-agnostic step parses and validates it.
   # ---------------------------------------------------------------------------
   identify-image:
     name: Identify image deployed to ${{ needs.validate.outputs.source_env }}
@@ -92,15 +95,40 @@ jobs:
       sha_tag:    ${{ steps.image.outputs.sha_tag }}
 
     steps:
+      - name: Resolve source environment cloud
+        id: cloud
+        run: |
+          CLOUD="${{ vars.DEPLOY_TARGET_CLOUD }}"
+          case "${CLOUD}" in
+            azure|aws|gcp)
+              echo "Source environment '${{ needs.validate.outputs.source_env }}' targets: ${CLOUD}"
+              echo "cloud=${CLOUD}" >> "$GITHUB_OUTPUT"
+              ;;
+            '')
+              echo "::error::DEPLOY_TARGET_CLOUD is not set for environment" \
+                "'${{ needs.validate.outputs.source_env }}'. Configure it as a" \
+                "GitHub Environment variable (or a repository-level default)" \
+                "with one of: azure | aws | gcp."
+              exit 1
+              ;;
+            *)
+              echo "::error::Invalid DEPLOY_TARGET_CLOUD value '${CLOUD}' for" \
+                "environment '${{ needs.validate.outputs.source_env }}'." \
+                "Allowed values: azure | aws | gcp."
+              exit 1
+              ;;
+          esac
+
       - name: Azure login (OIDC)
+        if: steps.cloud.outputs.cloud == 'azure'
         uses: azure/login@v3
         with:
           client-id:       ${{ vars.AZURE_CLIENT_ID }}
           tenant-id:       ${{ vars.AZURE_TENANT_ID }}
           subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
 
-      - name: Read current image from ${{ needs.validate.outputs.source_env }} Web App
-        id: image
+      - name: Read current image from Azure Web App
+        if: steps.cloud.outputs.cloud == 'azure'
         run: |
           RAW=$(az webapp config show \
             --resource-group "${{ vars.AZURE_RESOURCE_GROUP }}" \
@@ -110,12 +138,46 @@ jobs:
           echo "Raw linuxFxVersion: ${RAW}"
 
           # Strip DOCKER| prefix emitted by App Service
-          FULL="${RAW#DOCKER|}"
+          echo "IMAGE_REF=${RAW#DOCKER|}" >> "$GITHUB_ENV"
+
+      - name: Configure AWS credentials (OIDC)
+        if: steps.cloud.outputs.cloud == 'aws'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Read current image from ECS service
+        if: steps.cloud.outputs.cloud == 'aws'
+        run: |
+          TASKDEF=$(aws ecs describe-services \
+            --cluster  "${{ vars.AWS_ECS_CLUSTER }}" \
+            --services "${{ vars.AWS_ECS_SERVICE }}" \
+            --query 'services[0].taskDefinition' --output text)
+
+          IMG=$(aws ecs describe-task-definition \
+            --task-definition "${TASKDEF}" \
+            --query 'taskDefinition.containerDefinitions[0].image' --output text)
+
+          echo "Task definition: ${TASKDEF}"
+          echo "IMAGE_REF=${IMG}" >> "$GITHUB_ENV"
+
+      - name: Read current image from GCP (not implemented)
+        if: steps.cloud.outputs.cloud == 'gcp'
+        run: |
+          echo "::error::GCP image identification is not implemented yet —" \
+            "tracked in issue H10 (deors/template-helloworld-express#10)."
+          exit 1
+
+      - name: Parse and validate image reference
+        id: image
+        run: |
+          FULL="${IMAGE_REF}"
           IMAGE_BASE="${FULL%:*}"
           SHA_TAG="${FULL##*:}"
 
           if [[ "${IMAGE_BASE}" != ghcr.io/* ]]; then
-            echo "::error::${{ needs.validate.outputs.source_env }} Web App is not running a GHCR image (got: ${IMAGE_BASE})." \
+            echo "::error::${{ needs.validate.outputs.source_env }} is not running a GHCR image (got: ${IMAGE_BASE})." \
               "Ensure the source environment was deployed successfully before creating a release."
             exit 1
           fi
