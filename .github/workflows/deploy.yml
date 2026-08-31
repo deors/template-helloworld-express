@@ -4,10 +4,13 @@ name: Deploy
 # deployment to the matching cloud-specific reusable workflow. This file must
 # not contain any cloud-provider deployment commands.
 #
-# Cloud resolution precedence:
-#   1. workflow_dispatch input `cloud` (manual runs — always required)
-#   2. workflow_call input `cloud` (when the caller provides it)
-#   3. repository variable DEPLOY_TARGET_CLOUD (fallback for CI/release calls)
+# Cloud resolution: the DEPLOY_TARGET_CLOUD variable, read in the scope of the
+# target GitHub Environment. It is expected to be configured per environment
+# by the orchestrator, alongside the other cloud parameters (accounts,
+# subscriptions, principals, etc.). An environment-level value overrides a
+# repository-level one, so each environment can target a different cloud
+# (e.g. dev on azure, staging on aws, prod on gcp), while a repository-level
+# value acts as the default for environments that don't override it.
 #
 # Note: `uses:` references to reusable workflows are resolved when the run
 # starts, even for jobs skipped by their `if:` condition — so the three
@@ -24,12 +27,6 @@ on:
         description: Container image tag to deploy (e.g. sha-abc1234)
         type: string
         required: true
-      cloud:
-        description: >
-          Target cloud (azure | aws | gcp). When omitted, resolved from the
-          DEPLOY_TARGET_CLOUD repository variable.
-        type: string
-        required: false
   workflow_dispatch:
     inputs:
       environment:
@@ -41,17 +38,15 @@ on:
         description: Container image tag to deploy (e.g. sha-abc1234)
         type: string
         required: true
-      cloud:
-        description: Target cloud
-        type: choice
-        options: [azure, aws, gcp]
-        required: true
 
 jobs:
 
   resolve-cloud:
     name: Resolve target cloud
     runs-on: ubuntu-latest
+    # Bind to the target environment so vars.DEPLOY_TARGET_CLOUD resolves the
+    # environment-scoped value (falling back to the repository-level one).
+    environment: ${{ inputs.environment }}
     outputs:
       cloud: ${{ steps.resolve.outputs.cloud }}
 
@@ -59,31 +54,25 @@ jobs:
       - name: Resolve and validate target cloud
         id: resolve
         run: |
-          # Explicit input wins (workflow_dispatch makes it mandatory, so on
-          # manual runs it is always present); repository variable is the
-          # fallback for workflow_call invocations that omit it.
-          CLOUD="${{ inputs.cloud }}"
-          SOURCE="workflow input 'cloud'"
-          if [ -z "${CLOUD}" ]; then
-            CLOUD="${{ vars.DEPLOY_TARGET_CLOUD }}"
-            SOURCE="repository variable DEPLOY_TARGET_CLOUD"
-          fi
+          CLOUD="${{ vars.DEPLOY_TARGET_CLOUD }}"
 
           if [ -z "${CLOUD}" ]; then
-            echo "::error::No target cloud resolved." \
-              "Pass the 'cloud' input (azure | aws | gcp) or set the" \
-              "DEPLOY_TARGET_CLOUD repository variable."
+            echo "::error::DEPLOY_TARGET_CLOUD is not set for environment" \
+              "'${{ inputs.environment }}'. Configure it as an environment" \
+              "variable (or a repository-level default) with one of:" \
+              "azure | aws | gcp."
             exit 1
           fi
 
           case "${CLOUD}" in
             azure|aws|gcp)
-              echo "Target cloud: ${CLOUD} (from ${SOURCE})"
+              echo "Target cloud for '${{ inputs.environment }}': ${CLOUD}"
               echo "cloud=${CLOUD}" >> "$GITHUB_OUTPUT"
               ;;
             *)
-              echo "::error::Invalid target cloud '${CLOUD}' (from ${SOURCE})." \
-                "Allowed values: azure | aws | gcp."
+              echo "::error::Invalid DEPLOY_TARGET_CLOUD value '${CLOUD}' for" \
+                "environment '${{ inputs.environment }}'. Allowed values:" \
+                "azure | aws | gcp."
               exit 1
               ;;
           esac
