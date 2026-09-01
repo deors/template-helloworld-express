@@ -5,11 +5,14 @@ run-name: Release ${{ github.event.release.tag_name || inputs.release_tag }}
 # Triggered automatically when a GitHub Release is created.
 # workflow_dispatch is provided for testing without creating a real release.
 #
-# Release tag naming rules:
-#   X.Y.Z        → deploy to prod    (GA release;  image sourced from staging)
-#   X.Y.Z-RC     → deploy to staging (RC;           image sourced from dev)
+# The release's pre-release flag declares the intent; the tag format must
+# agree with it or the workflow fails:
+#   pre-release  → tag X.Y.Z-RC → deploy to staging (image sourced from dev)
+#   full release → tag X.Y.Z    → deploy to prod    (image sourced from staging)
 #   v prefix is accepted: v1.2.3, v1.2.3-RC
-#   Any other format fails the workflow immediately.
+#   Any other format, or a flag/format mismatch, fails the workflow immediately.
+# Manual runs (workflow_dispatch) have no pre-release flag, so the target is
+# derived from the tag format alone.
 
 on:
   release:
@@ -46,26 +49,50 @@ jobs:
         run: |
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             TAG="${{ inputs.release_tag }}"
+            # Manual runs have no pre-release flag: derive intent from the tag.
+            PRERELEASE=""
           else
             TAG="${{ github.event.release.tag_name }}"
+            PRERELEASE="${{ github.event.release.prerelease }}"
           fi
           echo "Release tag: ${TAG}"
 
           # Strip optional v prefix before semver validation
           CLEAN="${TAG#v}"
 
-          if [[ "${CLEAN}" =~ ^[0-9]+\.[0-9]+\.[0-9]+-RC$ ]]; then
+          IS_RC=false
+          IS_GA=false
+          [[ "${CLEAN}" =~ ^[0-9]+\.[0-9]+\.[0-9]+-RC$ ]] && IS_RC=true
+          [[ "${CLEAN}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] && IS_GA=true
+
+          if ! ${IS_RC} && ! ${IS_GA}; then
+            echo "::error::Invalid release tag '${TAG}'." \
+              "Expected X.Y.Z (full release) or X.Y.Z-RC (pre-release), with optional v prefix."
+            exit 1
+          fi
+
+          # On release events the pre-release flag declares the intent and the
+          # tag format must agree with it — never route on the tag alone.
+          if [ "${PRERELEASE}" = "true" ] && ! ${IS_RC}; then
+            echo "::error::Release is marked as pre-release but tagged '${TAG}'." \
+              "Pre-releases must be tagged X.Y.Z-RC."
+            exit 1
+          fi
+          if [ "${PRERELEASE}" = "false" ] && ! ${IS_GA}; then
+            echo "::error::Release is marked as a full release but tagged '${TAG}'." \
+              "Full releases must be tagged X.Y.Z without suffix —" \
+              "mark the release as a pre-release if an RC was intended."
+            exit 1
+          fi
+
+          if ${IS_RC}; then
             TARGET_ENV="staging"
             SOURCE_ENV="dev"
             echo "Release candidate → target: staging (image sourced from dev)"
-          elif [[ "${CLEAN}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+          else
             TARGET_ENV="prod"
             SOURCE_ENV="staging"
             echo "GA release → target: prod (image sourced from staging)"
-          else
-            echo "::error::Invalid release tag '${TAG}'." \
-              "Expected X.Y.Z (prod) or X.Y.Z-RC (staging), with optional v prefix."
-            exit 1
           fi
 
           {
