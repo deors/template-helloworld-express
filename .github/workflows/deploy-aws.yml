@@ -333,22 +333,37 @@ jobs:
 
           [[ "${STATUS}" == "ACTIVE" ]] \
             || { echo "::error::Service not ACTIVE (status=${STATUS})"; exit 1; }
-          [[ "${RUNNING}" -gt 0 && "${RUNNING}" -eq "${DESIRED}" ]] \
-            || { echo "::error::Running tasks (${RUNNING}) do not match desired (${DESIRED})"; exit 1; }
 
           echo "=== Deployment state ==="
           if [[ "${CONTROLLER}" == "CODE_DEPLOY" ]]; then
-            # Under CODE_DEPLOY `deployments` is null; the primary task set
-            # carries both the settled state and the live task definition.
-            read -r STABILITY TASKDEF <<<"$(aws ecs describe-services \
-              --cluster  "${{ vars.AWS_ECS_CLUSTER }}" \
-              --services "${{ vars.AWS_ECS_SERVICE }}" \
-              --query 'services[0].taskSets[?status==`PRIMARY`]|[0].[stabilityStatus, taskDefinition]' \
-              --output text)"
-            echo "Primary task set: ${STABILITY} (${TASKDEF})"
-            [[ "${STABILITY}" == "STEADY_STATE" ]] \
-              || { echo "::error::Primary task set not steady (stabilityStatus=${STABILITY})"; exit 1; }
+            # Under CODE_DEPLOY `deployments` is null and, right after a
+            # successful deployment, the service-level task counters span BOTH
+            # task sets until the old (blue) set finishes draining — so all
+            # assertions run against the PRIMARY task set. A short retry
+            # absorbs control-plane propagation just after cutover.
+            for i in 1 2 3 4 5 6; do
+              read -r STABILITY TS_RUNNING TS_DESIRED TASKDEF <<<"$(aws ecs describe-services \
+                --cluster  "${{ vars.AWS_ECS_CLUSTER }}" \
+                --services "${{ vars.AWS_ECS_SERVICE }}" \
+                --query 'services[0].taskSets[?status==`PRIMARY`]|[0].[stabilityStatus, runningCount, computedDesiredCount, taskDefinition]' \
+                --output text)"
+              echo "  attempt ${i}: primary task set ${STABILITY}, tasks ${TS_RUNNING}/${TS_DESIRED} (${TASKDEF})"
+              if [[ "${STABILITY}" == "STEADY_STATE" && "${TS_RUNNING}" -gt 0 \
+                    && "${TS_RUNNING}" -eq "${TS_DESIRED}" ]]; then
+                break
+              fi
+              if [[ "${i}" -eq 6 ]]; then
+                echo "::error::Primary task set did not settle" \
+                  "(stabilityStatus=${STABILITY}, tasks ${TS_RUNNING}/${TS_DESIRED})."
+                exit 1
+              fi
+              sleep 10
+            done
           else
+            # Service-level counters are only meaningful for the rolling
+            # controller, where a completed deployment owns all tasks.
+            [[ "${RUNNING}" -gt 0 && "${RUNNING}" -eq "${DESIRED}" ]] \
+              || { echo "::error::Running tasks (${RUNNING}) do not match desired (${DESIRED})"; exit 1; }
             ROLLOUT=$(aws ecs describe-services \
               --cluster  "${{ vars.AWS_ECS_CLUSTER }}" \
               --services "${{ vars.AWS_ECS_SERVICE }}" \
