@@ -74,6 +74,19 @@ jobs:
           role-to-assume: ${{ vars.AWS_ROLE_ARN }}
           aws-region: ${{ vars.AWS_REGION }}
 
+      - name: Detect deployment controller
+        # The infrastructure provisions services with different controllers
+        # (rolling `ECS` vs blue/green `CODE_DEPLOY`); the deployment and
+        # validation steps branch on this value.
+        id: controller
+        run: |
+          CONTROLLER=$(aws ecs describe-services \
+            --cluster  "${{ vars.AWS_ECS_CLUSTER }}" \
+            --services "${{ vars.AWS_ECS_SERVICE }}" \
+            --query 'services[0].deploymentController.type' --output text)
+          echo "Deployment controller: ${CONTROLLER}"
+          echo "type=${CONTROLLER}" >> "$GITHUB_OUTPUT"
+
       - name: Resolve image reference
         id: image
         run: |
@@ -126,7 +139,8 @@ jobs:
           echo "New task definition: ${NEW_ARN}"
           echo "arn=${NEW_ARN}" >> "$GITHUB_OUTPUT"
 
-      - name: Update ECS service
+      - name: Update ECS service (rolling)
+        if: steps.controller.outputs.type == 'ECS'
         run: |
           aws ecs update-service \
             --cluster         "${{ vars.AWS_ECS_CLUSTER }}" \
@@ -134,10 +148,11 @@ jobs:
             --task-definition "${{ steps.taskdef.outputs.arn }}" \
             --query 'service.serviceName' --output text
 
-      - name: Wait for service to reach steady state
+      - name: Wait for service to reach steady state (rolling)
         # Polls the service until the new deployment settles (new tasks
         # running and healthy, old tasks drained). The waiter checks every
         # 15 s up to 40 times (~10 min) and fails the job on timeout.
+        if: steps.controller.outputs.type == 'ECS'
         id: wait
         run: |
           aws ecs wait services-stable \
@@ -145,13 +160,93 @@ jobs:
             --services "${{ vars.AWS_ECS_SERVICE }}"
           echo "Service reached steady state."
 
+      - name: Create CodeDeploy deployment (blue/green)
+        # CODE_DEPLOY-controlled services reject `ecs update-service`; the new
+        # task definition ships as a CodeDeploy blue/green deployment instead.
+        # The CodeDeploy resource names are derived from the provisioning
+        # naming convention rather than configured — no extra variables.
+        if: steps.controller.outputs.type == 'CODE_DEPLOY'
+        id: bg_deploy
+        run: |
+          CD_APP="cd-${{ vars.AWS_ECS_SERVICE }}"
+          CD_GROUP="${{ vars.AWS_ECS_SERVICE }}-dg"
+
+          if ! aws deploy get-deployment-group \
+              --application-name    "${CD_APP}" \
+              --deployment-group-name "${CD_GROUP}" > /dev/null 2>&1; then
+            echo "::error::CodeDeploy resources not found for service" \
+              "'${{ vars.AWS_ECS_SERVICE }}': expected application '${CD_APP}'" \
+              "with deployment group '${CD_GROUP}' (derived by naming" \
+              "convention). Ensure the infrastructure provisions them under" \
+              "these names."
+            exit 1
+          fi
+
+          # Container name/port come from the revision registered above.
+          CONTAINER_NAME=$(jq -r '.containerDefinitions[0].name' new-task-def.json)
+          CONTAINER_PORT=$(jq -r '.containerDefinitions[0].portMappings[0].containerPort' new-task-def.json)
+
+          jq -n \
+            --arg     td "${{ steps.taskdef.outputs.arn }}" \
+            --arg     cn "${CONTAINER_NAME}" \
+            --argjson cp "${CONTAINER_PORT}" \
+            '{revisionType: "AppSpecContent",
+              appSpecContent: {content: ({
+                version: "0.0",
+                Resources: [{TargetService: {
+                  Type: "AWS::ECS::Service",
+                  Properties: {
+                    TaskDefinition: $td,
+                    LoadBalancerInfo: {ContainerName: $cn, ContainerPort: $cp}}}}]
+              } | tojson)}}' > revision.json
+
+          DEPLOYMENT_ID=$(aws deploy create-deployment \
+            --application-name      "${CD_APP}" \
+            --deployment-group-name "${CD_GROUP}" \
+            --revision file://revision.json \
+            --query deploymentId --output text)
+
+          echo "CodeDeploy deployment started: ${DEPLOYMENT_ID}"
+          echo "deployment_id=${DEPLOYMENT_ID}" >> "$GITHUB_OUTPUT"
+
+      - name: Wait for CodeDeploy deployment (blue/green)
+        # Linear traffic-shifting configs take ~10 minutes end to end; the
+        # waiter polls every 15 s with a 30-minute ceiling and fails the job
+        # if the deployment does not succeed.
+        if: steps.controller.outputs.type == 'CODE_DEPLOY'
+        id: bg_wait
+        run: |
+          echo "Waiting for deployment ${{ steps.bg_deploy.outputs.deployment_id }}" \
+            "(blue/green traffic shifting takes several minutes)…"
+          aws deploy wait deployment-successful \
+            --deployment-id "${{ steps.bg_deploy.outputs.deployment_id }}"
+          echo "Deployment succeeded and traffic fully shifted."
+
       - name: Diagnose failed deployment
         # The waiter only reports a timeout; the reasons live in the service
         # events and the stopped tasks. Surface them in the job log so a
         # failed rollout (e.g. crash-looping tasks) is diagnosable without
         # console access.
-        if: failure() && steps.wait.outcome == 'failure'
+        if: >-
+          failure() && (steps.wait.outcome == 'failure' ||
+          steps.bg_deploy.outcome == 'failure' ||
+          steps.bg_wait.outcome == 'failure')
         run: |
+          if [[ "${{ steps.controller.outputs.type }}" == "CODE_DEPLOY" ]]; then
+            echo "::group::CodeDeploy deployments"
+            CD_APP="cd-${{ vars.AWS_ECS_SERVICE }}"
+            CD_GROUP="${{ vars.AWS_ECS_SERVICE }}-dg"
+            for ID in $(aws deploy list-deployments \
+                --application-name      "${CD_APP}" \
+                --deployment-group-name "${CD_GROUP}" \
+                --query 'deployments[0:3]' --output text 2>/dev/null); do
+              aws deploy get-deployment --deployment-id "${ID}" \
+                --query 'deploymentInfo.{id:deploymentId,status:status,error:errorInformation,createTime:createTime}' \
+                --output json || true
+            done
+            echo "::endgroup::"
+          fi
+
           echo "::group::Deployments"
           aws ecs describe-services \
             --cluster  "${{ vars.AWS_ECS_CLUSTER }}" \
@@ -194,9 +289,12 @@ jobs:
       #   staging / prod — private-only ingress. The endpoint is unreachable
       #             from GitHub-hosted runners, so control-plane assertions are
       #             used instead:
-      #               • service status is ACTIVE and the primary deployment
-      #                 rollout is COMPLETED with all tasks running
-      #               • the service's task definition runs the expected image tag
+      #               • service status is ACTIVE with all tasks running
+      #               • the deployment settled: primary deployment rollout
+      #                 COMPLETED (rolling) or primary task set STEADY_STATE
+      #                 (blue/green — `deployments` is null under CODE_DEPLOY,
+      #                 the state lives in `taskSets`)
+      #               • the deployed task definition runs the expected image tag
       # -----------------------------------------------------------------------
 
       - name: Validate – HTTP smoke test (dev)
@@ -223,20 +321,43 @@ jobs:
       - name: Validate – control-plane assertions (staging / prod)
         if: inputs.environment != 'dev'
         run: |
+          CONTROLLER="${{ steps.controller.outputs.type }}"
+
           echo "=== Service state ==="
-          read -r STATUS ROLLOUT RUNNING DESIRED TASKDEF <<<"$(aws ecs describe-services \
+          read -r STATUS RUNNING DESIRED TASKDEF <<<"$(aws ecs describe-services \
             --cluster  "${{ vars.AWS_ECS_CLUSTER }}" \
             --services "${{ vars.AWS_ECS_SERVICE }}" \
-            --query 'services[0].[status, deployments[?status==`PRIMARY`]|[0].rolloutState, runningCount, desiredCount, taskDefinition]' \
+            --query 'services[0].[status, runningCount, desiredCount, taskDefinition]' \
             --output text)"
-          echo "Status: ${STATUS} | Rollout: ${ROLLOUT} | Tasks: ${RUNNING}/${DESIRED}"
+          echo "Status: ${STATUS} | Tasks: ${RUNNING}/${DESIRED} | Controller: ${CONTROLLER}"
 
           [[ "${STATUS}" == "ACTIVE" ]] \
             || { echo "::error::Service not ACTIVE (status=${STATUS})"; exit 1; }
-          [[ "${ROLLOUT}" == "COMPLETED" ]] \
-            || { echo "::error::Primary deployment rollout not COMPLETED (state=${ROLLOUT})"; exit 1; }
           [[ "${RUNNING}" -gt 0 && "${RUNNING}" -eq "${DESIRED}" ]] \
             || { echo "::error::Running tasks (${RUNNING}) do not match desired (${DESIRED})"; exit 1; }
+
+          echo "=== Deployment state ==="
+          if [[ "${CONTROLLER}" == "CODE_DEPLOY" ]]; then
+            # Under CODE_DEPLOY `deployments` is null; the primary task set
+            # carries both the settled state and the live task definition.
+            read -r STABILITY TASKDEF <<<"$(aws ecs describe-services \
+              --cluster  "${{ vars.AWS_ECS_CLUSTER }}" \
+              --services "${{ vars.AWS_ECS_SERVICE }}" \
+              --query 'services[0].taskSets[?status==`PRIMARY`]|[0].[stabilityStatus, taskDefinition]' \
+              --output text)"
+            echo "Primary task set: ${STABILITY} (${TASKDEF})"
+            [[ "${STABILITY}" == "STEADY_STATE" ]] \
+              || { echo "::error::Primary task set not steady (stabilityStatus=${STABILITY})"; exit 1; }
+          else
+            ROLLOUT=$(aws ecs describe-services \
+              --cluster  "${{ vars.AWS_ECS_CLUSTER }}" \
+              --services "${{ vars.AWS_ECS_SERVICE }}" \
+              --query 'services[0].deployments[?status==`PRIMARY`]|[0].rolloutState' \
+              --output text)
+            echo "Primary deployment rollout: ${ROLLOUT}"
+            [[ "${ROLLOUT}" == "COMPLETED" ]] \
+              || { echo "::error::Primary deployment rollout not COMPLETED (state=${ROLLOUT})"; exit 1; }
+          fi
 
           echo "=== Deployed image tag ==="
           IMG=$(aws ecs describe-task-definition \
