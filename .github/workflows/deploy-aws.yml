@@ -402,14 +402,24 @@ jobs:
             # controller, where a completed deployment owns all tasks.
             [[ "${RUNNING}" -gt 0 && "${RUNNING}" -eq "${DESIRED}" ]] \
               || { echo "::error::Running tasks (${RUNNING}) do not match desired (${DESIRED})"; exit 1; }
-            ROLLOUT=$(aws ecs describe-services \
-              --cluster  "${{ vars.AWS_ECS_CLUSTER }}" \
-              --services "${{ vars.AWS_ECS_SERVICE }}" \
-              --query 'services[0].deployments[?status==`PRIMARY`]|[0].rolloutState' \
-              --output text)
-            echo "Primary deployment rollout: ${ROLLOUT}"
-            [[ "${ROLLOUT}" == "COMPLETED" ]] \
-              || { echo "::error::Primary deployment rollout not COMPLETED (state=${ROLLOUT})"; exit 1; }
+            # rolloutState flips to COMPLETED shortly AFTER the stability
+            # waiter returns; retry briefly rather than racing the flip.
+            for i in 1 2 3 4 5 6; do
+              ROLLOUT=$(aws ecs describe-services \
+                --cluster  "${{ vars.AWS_ECS_CLUSTER }}" \
+                --services "${{ vars.AWS_ECS_SERVICE }}" \
+                --query 'services[0].deployments[?status==`PRIMARY`]|[0].rolloutState' \
+                --output text)
+              echo "  attempt ${i}: primary deployment rollout ${ROLLOUT}"
+              if [[ "${ROLLOUT}" == "COMPLETED" ]]; then
+                break
+              fi
+              if [[ "${i}" -eq 6 ]]; then
+                echo "::error::Primary deployment rollout not COMPLETED (state=${ROLLOUT})."
+                exit 1
+              fi
+              sleep 10
+            done
           fi
 
           echo "=== Deployed image tag ==="
