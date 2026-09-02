@@ -210,17 +210,77 @@ jobs:
           echo "deployment_id=${DEPLOYMENT_ID}" >> "$GITHUB_OUTPUT"
 
       - name: Wait for CodeDeploy deployment (blue/green)
-        # Linear traffic-shifting configs take ~10 minutes end to end; the
-        # waiter polls every 15 s with a 30-minute ceiling and fails the job
-        # if the deployment does not succeed.
+        # Polls the deployment every 15 s (120 attempts ≈ 30-minute ceiling,
+        # matching the CLI waiter) and logs status, the lifecycle stage in
+        # progress, and the live ALB traffic split. The job log is the
+        # reference progress view: the ECS console's task-set traffic column
+        # lags until the task-set swap completes, and the two target groups
+        # alternate blue/green roles between deployments. Reading the traffic
+        # weights needs elasticloadbalancing:DescribeListeners on the deploy
+        # role; without it the loop degrades to status/stage reporting.
         if: steps.controller.outputs.type == 'CODE_DEPLOY'
         id: bg_wait
         run: |
-          echo "Waiting for deployment ${{ steps.bg_deploy.outputs.deployment_id }}" \
+          DEPLOYMENT_ID="${{ steps.bg_deploy.outputs.deployment_id }}"
+          echo "Waiting for deployment ${DEPLOYMENT_ID}" \
             "(blue/green traffic shifting takes several minutes)…"
-          aws deploy wait deployment-successful \
-            --deployment-id "${{ steps.bg_deploy.outputs.deployment_id }}"
-          echo "Deployment succeeded and traffic fully shifted."
+
+          LISTENER=$(aws deploy get-deployment-group \
+            --application-name      "cd-${{ vars.AWS_ECS_SERVICE }}" \
+            --deployment-group-name "${{ vars.AWS_ECS_SERVICE }}-dg" \
+            --query 'deploymentGroupInfo.loadBalancerInfo.targetGroupPairInfoList[0].prodTrafficRoute.listenerArns[0]' \
+            --output text 2>/dev/null || true)
+          WEIGHTS_OK=true
+
+          for i in $(seq 1 120); do
+            STATUS=$(aws deploy get-deployment \
+              --deployment-id "${DEPLOYMENT_ID}" \
+              --query 'deploymentInfo.status' --output text)
+
+            STAGE=$(aws deploy get-deployment-target \
+              --deployment-id "${DEPLOYMENT_ID}" \
+              --target-id "${{ vars.AWS_ECS_CLUSTER }}:${{ vars.AWS_ECS_SERVICE }}" \
+              --query 'deploymentTarget.ecsTarget.lifecycleEvents[?status==`InProgress`]|[0].lifecycleEventName' \
+              --output text 2>/dev/null || true)
+            [[ -z "${STAGE}" || "${STAGE}" == "None" ]] && STAGE="-"
+
+            TRAFFIC=""
+            if [[ -n "${LISTENER}" && "${WEIGHTS_OK}" == "true" ]]; then
+              if RAW=$(aws elbv2 describe-listeners \
+                  --listener-arns "${LISTENER}" \
+                  --query 'Listeners[0].DefaultActions[0].ForwardConfig.TargetGroups[].[TargetGroupArn, Weight]' \
+                  --output text 2>/dev/null); then
+                TRAFFIC=$(awk -F'\t' '{n=split($1,a,"/"); printf "%s=%s%% ", a[n-1], $2}' <<<"${RAW}")
+              else
+                WEIGHTS_OK=false
+                echo "  (traffic weights unavailable — the deploy role may lack" \
+                  "elasticloadbalancing:DescribeListeners; continuing with" \
+                  "status/stage only)"
+              fi
+            fi
+
+            echo "  [$(( (i - 1) * 15 ))s] status=${STATUS} stage=${STAGE} ${TRAFFIC}"
+
+            case "${STATUS}" in
+              Succeeded)
+                echo "Deployment succeeded and traffic fully shifted."
+                exit 0
+                ;;
+              Failed|Stopped)
+                ERR=$(aws deploy get-deployment \
+                  --deployment-id "${DEPLOYMENT_ID}" \
+                  --query 'deploymentInfo.errorInformation' --output json)
+                echo "::error::CodeDeploy deployment ${DEPLOYMENT_ID} ended as" \
+                  "${STATUS}: ${ERR}"
+                exit 1
+                ;;
+            esac
+            sleep 15
+          done
+
+          echo "::error::CodeDeploy deployment ${DEPLOYMENT_ID} did not complete" \
+            "within 30 minutes (last status: ${STATUS}, stage: ${STAGE})."
+          exit 1
 
       - name: Diagnose failed deployment
         # The waiter only reports a timeout; the reasons live in the service
