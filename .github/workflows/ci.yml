@@ -9,6 +9,7 @@ permissions:
   contents: read
   packages: write
   id-token: write
+  issues: write
 
 jobs:
   build-test-push:
@@ -68,8 +69,6 @@ jobs:
         # produces a private package.
         # App Service (which has no registry credentials) can pull the image as
         # long as the repository — and therefore the package — is public.
-        # For private repositories use Strategy 2 (GHCR + credentials) or
-        # Strategy 3 (ACR + Managed Identity) as documented in the README.
         run: |
           docker push "${{ steps.meta.outputs.image_full }}"
           docker push "${{ steps.meta.outputs.image_base }}:latest"

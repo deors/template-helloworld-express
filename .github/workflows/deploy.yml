@@ -77,6 +77,45 @@ jobs:
               ;;
           esac
 
+  open-report:
+    name: Open deployment report
+    needs: resolve-cloud
+    if: inputs.environment != 'dev'
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+    outputs:
+      issue_number: ${{ steps.open.outputs.number }}
+
+    steps:
+      - name: Open deployment report issue
+        id: open
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cat > body.md <<'EOF'
+          Deployment started.
+
+          | | |
+          | --- | --- |
+          | Environment | `${{ inputs.environment }}` |
+          | Target cloud | `${{ needs.resolve-cloud.outputs.cloud }}` |
+          | Image tag | `${{ inputs.image_tag }}` |
+          | Trigger | `${{ github.event_name }}` via workflow `${{ github.workflow }}` |
+          | Initiated by | @${{ github.actor }} |
+          | Commit | ${{ github.sha }} |
+          | Workflow run | ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }} |
+
+          The result will be posted as a comment when the deployment finishes.
+          EOF
+
+          URL=$(gh issue create \
+            --repo "${GITHUB_REPOSITORY}" \
+            --title "Deployment: ${{ inputs.image_tag }} → ${{ inputs.environment }} (${{ needs.resolve-cloud.outputs.cloud }})" \
+            --body-file body.md)
+          echo "Opened ${URL}"
+          echo "number=${URL##*/}" >> "$GITHUB_OUTPUT"
+
   deploy-azure:
     name: Deploy on Azure
     needs: resolve-cloud
@@ -115,3 +154,70 @@ jobs:
       environment: ${{ inputs.environment }}
       image_tag: ${{ inputs.image_tag }}
     secrets: inherit
+
+  report-result:
+    name: Report deployment result
+    needs: [resolve-cloud, open-report, deploy-azure, deploy-aws, deploy-gcp]
+    if: always() && needs.resolve-cloud.result == 'success'
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+
+    steps:
+      - name: Write deployment summary
+        run: |
+          case "${{ needs.resolve-cloud.outputs.cloud }}" in
+            azure) OUTCOME="${{ needs.deploy-azure.result }}" ;;
+            aws)   OUTCOME="${{ needs.deploy-aws.result }}" ;;
+            gcp)   OUTCOME="${{ needs.deploy-gcp.result }}" ;;
+          esac
+
+          ICON="❌"
+          [ "${OUTCOME}" = "success" ] && ICON="✅"
+
+          {
+            echo "OUTCOME=${OUTCOME}"
+            echo "ICON=${ICON}"
+          } >> "$GITHUB_ENV"
+
+          cat >> "$GITHUB_STEP_SUMMARY" <<EOF
+          ## ${ICON} Deployment: ${{ inputs.image_tag }} → ${{ inputs.environment }} (${{ needs.resolve-cloud.outputs.cloud }})
+
+          | | |
+          | --- | --- |
+          | Outcome | **${OUTCOME}** |
+          | Environment | \`${{ inputs.environment }}\` |
+          | Target cloud | \`${{ needs.resolve-cloud.outputs.cloud }}\` |
+          | Image tag | \`${{ inputs.image_tag }}\` |
+          | Trigger | \`${{ github.event_name }}\` via workflow \`${{ github.workflow }}\` |
+          | Initiated by | @${{ github.actor }} |
+          | Commit | ${{ github.sha }} |
+          | Finished at | $(date -u +'%Y-%m-%dT%H:%M:%SZ') |
+          | Azure / AWS / GCP jobs | ${{ needs.deploy-azure.result }} / ${{ needs.deploy-aws.result }} / ${{ needs.deploy-gcp.result }} |
+          EOF
+
+      - name: Comment result on the report issue and close on success
+        # Only staging/prod deployments have a report issue
+        if: needs.open-report.result == 'success'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ISSUE: ${{ needs.open-report.outputs.issue_number }}
+        run: |
+          cat > comment.md <<EOF
+          ${ICON} Deployment finished: **${OUTCOME}**
+
+          | | |
+          | --- | --- |
+          | Azure job | ${{ needs.deploy-azure.result }} |
+          | AWS job | ${{ needs.deploy-aws.result }} |
+          | GCP job | ${{ needs.deploy-gcp.result }} |
+          | Evidence | ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }} |
+          EOF
+
+          gh issue comment "${ISSUE}" --repo "${GITHUB_REPOSITORY}" --body-file comment.md
+
+          if [ "${OUTCOME}" = "success" ]; then
+            gh issue close "${ISSUE}" --repo "${GITHUB_REPOSITORY}" --reason completed
+          else
+            echo "Deployment outcome is '${OUTCOME}' — leaving the report issue open."
+          fi
