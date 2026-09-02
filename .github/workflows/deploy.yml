@@ -94,8 +94,11 @@ jobs:
 
     steps:
       - name: Write deployment start summary
+        # Builds the canonical start record (started.md) and appends it to the
+        # run summary; the issue step reuses the same file so both reporting
+        # mechanisms carry the same table and facts.
         run: |
-          cat >> "$GITHUB_STEP_SUMMARY" <<EOF
+          cat > started.md <<EOF
           ## 🚀 Deployment started: ${{ inputs.image_tag }} → ${{ inputs.environment }} (${{ needs.resolve-cloud.outputs.cloud }})
 
           | | |
@@ -107,7 +110,10 @@ jobs:
           | Initiated by | @${{ github.actor }} |
           | Commit | ${{ github.sha }} |
           | Started at | $(date -u +'%Y-%m-%dT%H:%M:%SZ') |
+          | Workflow run | ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }} |
           EOF
+
+          cat started.md >> "$GITHUB_STEP_SUMMARY"
 
       - name: Open deployment report issue
         id: open
@@ -115,18 +121,8 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          cat > body.md <<'EOF'
-          Deployment started.
-
-          | | |
-          | --- | --- |
-          | Environment | `${{ inputs.environment }}` |
-          | Target cloud | `${{ needs.resolve-cloud.outputs.cloud }}` |
-          | Image tag | `${{ inputs.image_tag }}` |
-          | Trigger | `${{ github.event_name }}` via workflow `${{ github.workflow }}` |
-          | Initiated by | @${{ github.actor }} |
-          | Commit | ${{ github.sha }} |
-          | Workflow run | ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }} |
+          cp started.md body.md
+          cat >> body.md <<'EOF'
 
           The result will be posted as a comment when the deployment finishes.
           This issue stays open until a project member reviews the results and
@@ -204,17 +200,24 @@ jobs:
             echo "ICON=${ICON}"
           } >> "$GITHUB_ENV"
 
-          # Second half of the run-summary audit record: the start segment
-          # (resolve-cloud) already carries the who/what/how/when evidence.
-          cat >> "$GITHUB_STEP_SUMMARY" <<EOF
+          # Builds the canonical result record (finished.md) and appends it to
+          # the run summary; the issue step reuses the same file so both
+          # reporting mechanisms carry the same table and facts. The start
+          # segment already carries the who/what/how/when evidence.
+          cat > finished.md <<EOF
           ## ${ICON} Deployment finished: ${{ inputs.image_tag }} → ${{ inputs.environment }} (${{ needs.resolve-cloud.outputs.cloud }})
 
           | | |
           | --- | --- |
           | Outcome | **${OUTCOME}** |
-          | Azure / AWS / GCP jobs | ${{ needs.deploy-azure.result }} / ${{ needs.deploy-aws.result }} / ${{ needs.deploy-gcp.result }} |
+          | Azure job | ${{ needs.deploy-azure.result }} |
+          | AWS job | ${{ needs.deploy-aws.result }} |
+          | GCP job | ${{ needs.deploy-gcp.result }} |
           | Finished at | $(date -u +'%Y-%m-%dT%H:%M:%SZ') |
+          | Evidence | ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }} |
           EOF
+
+          cat finished.md >> "$GITHUB_STEP_SUMMARY"
 
       - name: Comment result on the report issue
         # Only staging/prod deployments have a report issue (the open step
@@ -227,15 +230,8 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           ISSUE: ${{ needs.open-report.outputs.issue_number }}
         run: |
-          cat > comment.md <<EOF
-          ${ICON} Deployment finished: **${OUTCOME}**
-
-          | | |
-          | --- | --- |
-          | Azure job | ${{ needs.deploy-azure.result }} |
-          | AWS job | ${{ needs.deploy-aws.result }} |
-          | GCP job | ${{ needs.deploy-gcp.result }} |
-          | Evidence | ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }} |
+          cp finished.md comment.md
+          cat >> comment.md <<'EOF'
 
           Review the results and the linked evidence, then close this issue to acknowledge the deployment.
           EOF
