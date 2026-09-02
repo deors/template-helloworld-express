@@ -340,46 +340,24 @@ jobs:
             "does not match the app's contract)."
 
       # -----------------------------------------------------------------------
-      # Validation strategy differs by environment network exposure, mirroring
-      # the Azure workflow:
+      # Post-deploy validation, mirroring the Azure workflow:
       #
-      #   dev     — public endpoint is open. Poll /health over HTTPS from the
-      #             runner using AWS_APP_URL.
-      #
-      #   staging / prod — private-only ingress. The endpoint is unreachable
-      #             from GitHub-hosted runners, so control-plane assertions are
-      #             used instead:
+      #   all environments — control-plane assertions. They catch failures the
+      #             stability wait alone can miss (e.g. a rolled-back
+      #             deployment that settles on the previous revision):
       #               • service status is ACTIVE with all tasks running
       #               • the deployment settled: primary deployment rollout
       #                 COMPLETED (rolling) or primary task set STEADY_STATE
       #                 (blue/green — `deployments` is null under CODE_DEPLOY,
       #                 the state lives in `taskSets`)
       #               • the deployed task definition runs the expected image tag
+      #
+      #   dev only — additionally, an HTTP smoke test of /health over the
+      #             public endpoint (AWS_APP_URL). Staging/prod ingress is
+      #             private-only and unreachable from GitHub-hosted runners.
       # -----------------------------------------------------------------------
 
-      - name: Validate – HTTP smoke test (dev)
-        if: inputs.environment == 'dev'
-        run: |
-          APP_URL="${{ vars.AWS_APP_URL }}"
-          echo "Smoke-testing ${APP_URL}/health …"
-
-          for i in $(seq 1 18); do
-            STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
-              --max-time 10 \
-              "${APP_URL}/health" || echo "000")
-            echo "  attempt ${i}: HTTP ${STATUS}"
-            if [ "${STATUS}" = "200" ]; then
-              echo "Health check passed."
-              exit 0
-            fi
-            sleep 10
-          done
-
-          echo "Health check timed out after 3 minutes."
-          exit 1
-
-      - name: Validate – control-plane assertions (staging / prod)
-        if: inputs.environment != 'dev'
+      - name: Validate – control-plane assertions
         run: |
           CONTROLLER="${{ steps.controller.outputs.type }}"
 
@@ -443,6 +421,27 @@ jobs:
             || { echo "::error::Deployed image (${IMG}) does not contain expected tag (${{ inputs.image_tag }})"; exit 1; }
 
           echo "Control-plane validation passed."
+
+      - name: Validate – HTTP smoke test (dev)
+        if: inputs.environment == 'dev'
+        run: |
+          APP_URL="${{ vars.AWS_APP_URL }}"
+          echo "Smoke-testing ${APP_URL}/health …"
+
+          for i in $(seq 1 18); do
+            STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+              --max-time 10 \
+              "${APP_URL}/health" || echo "000")
+            echo "  attempt ${i}: HTTP ${STATUS}"
+            if [ "${STATUS}" = "200" ]; then
+              echo "Health check passed."
+              exit 0
+            fi
+            sleep 10
+          done
+
+          echo "Health check timed out after 3 minutes."
+          exit 1
 
       - name: Confirm deployed version
         run: |
