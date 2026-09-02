@@ -129,21 +129,43 @@ jobs:
           exit 1
 
       # -----------------------------------------------------------------------
-      # Validation strategy differs by environment network exposure:
+      # Post-deploy validation:
       #
-      #   dev     — public endpoint is open (public_network_access_enabled=true
-      #             in Terraform).  Poll /health over HTTPS from the runner.
-      #
-      #   staging / prod — private-endpoint-only (public_network_access_enabled
-      #             =false).  The public hostname is unreachable from GitHub-
-      #             hosted runners, so we use control-plane assertions instead:
+      #   all environments — control-plane assertions (they also catch
+      #             misconfiguration such as a wrong resource group or app):
       #               • az webapp show          → App Service state == Running
       #               • az webapp config show   → linuxFxVersion contains
       #                                           the expected image tag
       #
-      # To use HTTP validation against staging/prod, provision self-hosted
-      # runners inside the VNet and remove the environment condition below.
+      #   dev only — additionally, an HTTP smoke test of /health over the
+      #             public endpoint (public_network_access_enabled=true in
+      #             Terraform). Staging/prod are private-endpoint-only and
+      #             unreachable from GitHub-hosted runners; to use HTTP
+      #             validation there, provision self-hosted runners inside
+      #             the VNet and remove the environment condition below.
       # -----------------------------------------------------------------------
+
+      - name: Validate – control-plane assertions
+        run: |
+          echo "=== App Service state ==="
+          STATE=$(az webapp show \
+            --resource-group "${{ vars.AZURE_RESOURCE_GROUP }}" \
+            --name            "${{ vars.AZURE_WEBAPP_NAME }}" \
+            --query state -o tsv)
+          echo "State: ${STATE}"
+          [[ "${STATE}" == "Running" ]] \
+            || { echo "::error::App not Running (state=${STATE})"; exit 1; }
+
+          echo "=== Deployed image tag ==="
+          IMG=$(az webapp config show \
+            --resource-group "${{ vars.AZURE_RESOURCE_GROUP }}" \
+            --name            "${{ vars.AZURE_WEBAPP_NAME }}" \
+            --query linuxFxVersion -o tsv)
+          echo "linuxFxVersion: ${IMG}"
+          grep -q "${{ inputs.image_tag }}" <<<"${IMG}" \
+            || { echo "::error::Deployed image (${IMG}) does not contain expected tag (${{ inputs.image_tag }})"; exit 1; }
+
+          echo "Control-plane validation passed."
 
       - name: Validate – HTTP smoke test (dev)
         if: inputs.environment == 'dev'
@@ -165,29 +187,6 @@ jobs:
 
           echo "Health check timed out after 3 minutes."
           exit 1
-
-      - name: Validate – control-plane assertions (staging / prod)
-        if: inputs.environment != 'dev'
-        run: |
-          echo "=== App Service state ==="
-          STATE=$(az webapp show \
-            --resource-group "${{ vars.AZURE_RESOURCE_GROUP }}" \
-            --name            "${{ vars.AZURE_WEBAPP_NAME }}" \
-            --query state -o tsv)
-          echo "State: ${STATE}"
-          [[ "${STATE}" == "Running" ]] \
-            || { echo "::error::App not Running (state=${STATE})"; exit 1; }
-
-          echo "=== Deployed image tag ==="
-          IMG=$(az webapp config show \
-            --resource-group "${{ vars.AZURE_RESOURCE_GROUP }}" \
-            --name            "${{ vars.AZURE_WEBAPP_NAME }}" \
-            --query linuxFxVersion -o tsv)
-          echo "linuxFxVersion: ${IMG}"
-          grep -q "${{ inputs.image_tag }}" <<<"${IMG}" \
-            || { echo "::error::Deployed image (${IMG}) does not contain expected tag (${{ inputs.image_tag }})"; exit 1; }
-
-          echo "Control-plane validation passed."
 
       - name: Confirm deployed version
         run: |
