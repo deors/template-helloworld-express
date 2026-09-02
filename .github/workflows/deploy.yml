@@ -129,6 +129,8 @@ jobs:
           | Workflow run | ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }} |
 
           The result will be posted as a comment when the deployment finishes.
+          This issue stays open until a project member reviews the results and
+          closes it to acknowledge the deployment.
           EOF
 
           URL=$(gh issue create \
@@ -214,9 +216,12 @@ jobs:
           | Finished at | $(date -u +'%Y-%m-%dT%H:%M:%SZ') |
           EOF
 
-      - name: Comment result on the report issue and close on success
+      - name: Comment result on the report issue
         # Only staging/prod deployments have a report issue (the open step
-        # is skipped for dev, leaving the issue_number output empty).
+        # is skipped for dev, leaving the issue_number output empty). The
+        # issue is deliberately never closed by automation: a project member
+        # reviews the results and evidence and closes it to acknowledge —
+        # whatever the outcome.
         if: needs.open-report.result == 'success' && needs.open-report.outputs.issue_number != ''
         env:
           GH_TOKEN: ${{ github.token }}
@@ -231,12 +236,8 @@ jobs:
           | AWS job | ${{ needs.deploy-aws.result }} |
           | GCP job | ${{ needs.deploy-gcp.result }} |
           | Evidence | ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }} |
+
+          Review the results and the linked evidence, then close this issue to acknowledge the deployment.
           EOF
 
           gh issue comment "${ISSUE}" --repo "${GITHUB_REPOSITORY}" --body-file comment.md
-
-          if [ "${OUTCOME}" = "success" ]; then
-            gh issue close "${ISSUE}" --repo "${GITHUB_REPOSITORY}" --reason completed
-          else
-            echo "Deployment outcome is '${OUTCOME}' — leaving the report issue open."
-          fi
