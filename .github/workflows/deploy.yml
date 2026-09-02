@@ -78,9 +78,14 @@ jobs:
           esac
 
   open-report:
+    # Start half of the deployment audit record, mirroring report-result's
+    # structure — one job, two steps: the run-summary segment is written for
+    # every environment; the report issue is opened for staging/prod only
+    # (dev deploys are part of the fail-early CI loop and keep no issue
+    # trail). Runs in parallel with the deploy jobs so reporting never
+    # blocks a deployment.
     name: Open deployment report
     needs: resolve-cloud
-    if: inputs.environment != 'dev'
     runs-on: ubuntu-latest
     permissions:
       issues: write
@@ -88,8 +93,25 @@ jobs:
       issue_number: ${{ steps.open.outputs.number }}
 
     steps:
+      - name: Write deployment start summary
+        run: |
+          cat >> "$GITHUB_STEP_SUMMARY" <<EOF
+          ## 🚀 Deployment started: ${{ inputs.image_tag }} → ${{ inputs.environment }} (${{ needs.resolve-cloud.outputs.cloud }})
+
+          | | |
+          | --- | --- |
+          | Environment | \`${{ inputs.environment }}\` |
+          | Target cloud | \`${{ needs.resolve-cloud.outputs.cloud }}\` |
+          | Image tag | \`${{ inputs.image_tag }}\` |
+          | Trigger | \`${{ github.event_name }}\` via workflow \`${{ github.workflow }}\` |
+          | Initiated by | @${{ github.actor }} |
+          | Commit | ${{ github.sha }} |
+          | Started at | $(date -u +'%Y-%m-%dT%H:%M:%SZ') |
+          EOF
+
       - name: Open deployment report issue
         id: open
+        if: inputs.environment != 'dev'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -180,25 +202,22 @@ jobs:
             echo "ICON=${ICON}"
           } >> "$GITHUB_ENV"
 
+          # Second half of the run-summary audit record: the start segment
+          # (resolve-cloud) already carries the who/what/how/when evidence.
           cat >> "$GITHUB_STEP_SUMMARY" <<EOF
-          ## ${ICON} Deployment: ${{ inputs.image_tag }} → ${{ inputs.environment }} (${{ needs.resolve-cloud.outputs.cloud }})
+          ## ${ICON} Deployment finished: ${{ inputs.image_tag }} → ${{ inputs.environment }} (${{ needs.resolve-cloud.outputs.cloud }})
 
           | | |
           | --- | --- |
           | Outcome | **${OUTCOME}** |
-          | Environment | \`${{ inputs.environment }}\` |
-          | Target cloud | \`${{ needs.resolve-cloud.outputs.cloud }}\` |
-          | Image tag | \`${{ inputs.image_tag }}\` |
-          | Trigger | \`${{ github.event_name }}\` via workflow \`${{ github.workflow }}\` |
-          | Initiated by | @${{ github.actor }} |
-          | Commit | ${{ github.sha }} |
-          | Finished at | $(date -u +'%Y-%m-%dT%H:%M:%SZ') |
           | Azure / AWS / GCP jobs | ${{ needs.deploy-azure.result }} / ${{ needs.deploy-aws.result }} / ${{ needs.deploy-gcp.result }} |
+          | Finished at | $(date -u +'%Y-%m-%dT%H:%M:%SZ') |
           EOF
 
       - name: Comment result on the report issue and close on success
-        # Only staging/prod deployments have a report issue
-        if: needs.open-report.result == 'success'
+        # Only staging/prod deployments have a report issue (the open step
+        # is skipped for dev, leaving the issue_number output empty).
+        if: needs.open-report.result == 'success' && needs.open-report.outputs.issue_number != ''
         env:
           GH_TOKEN: ${{ github.token }}
           ISSUE: ${{ needs.open-report.outputs.issue_number }}
