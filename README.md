@@ -4,10 +4,10 @@ A **GitHub template repository** — the application-side starting point for wor
 
 When an operator clicks **Provision Infrastructure**, the platform workflow:
 
-1. Provisions Azure infrastructure (Web App + Plan + VNet + PE + MI + Log Analytics + autoscale + slot) across `dev`, `staging`, `prod`.
+1. Provisions the cloud infrastructure for the application (Azure, AWS, or GCP, per the platform's infrastructure templates) across `dev`, `staging`, `prod`.
 2. Creates a new repo under the same org using **this template**.
 3. Opens a tracking issue in the new repo.
-4. Creates GitHub Environments (`dev`, `staging`, `prod`) and writes per-environment **variables** into each.
+4. Creates GitHub Environments (`dev`, `staging`, `prod`) and writes per-environment **variables** into each — including `DEPLOY_TARGET_CLOUD`, which tells the deploy router where that environment lives (see [Cloud resolution](#cloud-resolution)).
 5. Watches the **`ci.yml`** run that GitHub auto-triggers from the initial
    `push` to `main` after template generation (the platform doesn't dispatch
    it — it observes the auto-trigger).
@@ -22,10 +22,10 @@ The run is considered successful when `ci.yml` (which includes a dev deploy) rea
 | Path | Method | Response |
 |------|--------|----------|
 | `/` | GET | HTML hello-world page (app name, env, image tag) |
-| `/health` | GET | `200 OK` — used by App Service health checks |
+| `/health` | GET | `200 OK` — used by platform health checks and deploy smoke tests |
 | `/whois` | GET | JSON `{ app_name, environment, image_tag }` |
 
-Runtime configuration is injected as environment variables by `deploy.yml` and/or App Service app settings:
+Runtime configuration is injected as environment variables by the deploy workflows (and/or the cloud runtime's own settings):
 
 | Variable | Purpose | Default (local) |
 |----------|---------|-----------------|
@@ -67,6 +67,15 @@ docker run --rm -p 8080:8080 \
 
 ## Workflow overview
 
+The CI/CD pipeline is **cloud-agnostic**: build and release logic never mention a cloud provider. All deployments funnel through the `deploy.yml` router, which resolves the target cloud per environment and delegates to a cloud-specific reusable workflow:
+
+``` text
+ci.yml ──────────────┐
+release.yml ─────────┤                      ┌─ deploy-azure.yml  (e.g. App Service)
+                     ├─▶ deploy.yml ────────┼─ deploy-aws.yml    (e.g. ECS Fargate)
+manual dispatch ─────┘    (cloud router)    └─ deploy-gcp.yml    (comming soon)
+```
+
 ### `ci.yml` — Continuous Integration
 
 Triggered by `push` on `main` (auto-fired by the initial commit GitHub
@@ -80,10 +89,10 @@ push / workflow_dispatch
         ├─ docker build & push → ghcr.io/<owner>/<repo>:sha-<short>
         └─ outputs: image_tag
   └─ deploy-dev  (calls deploy.yml with environment=dev)
-        └─ OIDC login → image swap → restart → smoke test
+        └─ resolve cloud → provider deploy → post-deploy validation
 ```
 
-The entire run — including the dev deploy — must be green for the platform to consider bootstrap successful.
+`ci.yml` contains no cloud-specific logic and no cloud parameter — the dev environment's own configuration decides where it deploys. The entire run — including the dev deploy — must be green for the platform to consider bootstrap successful.
 
 ### `release.yml` — Release & Promotion
 
@@ -92,45 +101,106 @@ Triggered when a **GitHub Release is created**. Also has a `workflow_dispatch` t
 ``` text
 release created / workflow_dispatch
   └─ validate
-        └─ parse tag → determine target environment
-  └─ identify-image  (environment: dev)
-        └─ OIDC login → az webapp config show → extract sha-* tag
+        └─ pre-release flag declares intent → tag format must agree → target environment
+  └─ identify-image  (environment: dev for RC, staging for GA)
+        └─ resolve source env cloud → read the sha-* tag currently running there
   └─ retag-image
         └─ docker pull sha-tag → docker tag release-tag → docker push
   └─ deploy  (calls deploy.yml with target environment + release tag)
 ```
 
-#### Release tag naming rules
+The `identify-image` job is cloud-aware: it resolves the **source** environment's cloud from `DEPLOY_TARGET_CLOUD` (same rule as the router) and runs the matching read-only query — Azure Web App `linuxFxVersion`, or the ECS service's current task definition image. Source and target environments may live on different clouds.
 
-| Tag format | Example | Target |
-|------------|---------|--------|
-| `X.Y.Z` | `1.4.0` | `prod` |
-| `X.Y.Z-RC` | `1.4.0-RC` | `staging` |
-| `vX.Y.Z` / `vX.Y.Z-RC` | `v1.4.0-RC` | same as above, `v` prefix accepted |
-| Any other format | `1.4.0-beta` | workflow fails immediately |
+#### Release routing rules
+
+On release events, the release's **pre-release flag declares the intent**, and the tag format must agree with it — the workflow never routes on the tag alone:
+
+| Release type | Required tag format | Example | Target |
+|--------------|--------------------|---------|--------|
+| Pre-release ✔ | `X.Y.Z-RC` | `1.4.0-RC` | `staging` |
+| Full release | `X.Y.Z` (no suffix) | `1.4.0` | `prod` |
+| — | `v` prefix accepted | `v1.4.0-RC` | same as above |
+
+A flag/format mismatch (e.g. a pre-release tagged `1.4.0`, or a full release tagged `1.4.0-RC`) or any other tag format fails the workflow immediately, before any image or deployment action. Manual `workflow_dispatch` runs have no pre-release flag, so the target is derived from the tag format alone (testing path).
 
 #### Image tagging strategy
 
-The workflow does not build a new image. It reads the `sha-*` tag currently deployed to dev (via `az webapp config show`), adds the release version as a second tag to the same image digest in GHCR, and deploys that tag to the target environment. At any point in time the same image may carry multiple tags:
+The workflow does not build a new image. It reads the `sha-*` tag currently deployed to the development `dev` environment, adds the release version as a second tag to the same image digest in GHCR, and deploys that tag to the target environment. At any point in time the same image may carry multiple tags:
 
 | Tag | Meaning |
 |-----|---------|
-| `sha-abc1234` | built from commit `abc1234`, deployed to dev |
-| `1.4.0-RC` | promoted to staging as release candidate |
-| `1.4.0` | promoted to prod as GA release |
+| `sha-abc1234` | built from commit `abc1234`, deployed to `dev` |
+| `1.4.0-RC` | promoted to `staging` as release candidate |
+| `1.4.0` | promoted to `prod` as GA release |
 
-### `deploy.yml` — Reusable Deploy
+### `deploy.yml` — Cloud-agnostic deploy router
 
-Reusable workflow (`workflow_call`). Called by `ci.yml` for dev on every push and by `release.yml` for staging/prod promotions.
+Reusable workflow (`workflow_call`), also manually runnable (`workflow_dispatch`). Called by `ci.yml` for dev on every push and by `release.yml` for staging/prod promotions. It contains **no cloud-provider deployment commands**: it resolves the target cloud, opens the deployment report, routes to the matching cloud workflow, and reports the result. In the future, provenance & attestation will be crafted into this workflow.
 
 #### Inputs
 
 | Input | Type | Description |
 |-------|------|-------------|
 | `environment` | string | `dev`, `staging`, or `prod` |
-| `image_tag` | string | Tag to deploy, e.g. `sha-abc1234` |
+| `image_tag` | string | Tag to deploy, e.g. `sha-abc1234` or `1.4.0-RC` |
 
-#### GitHub Environment variables consumed (set by the platform workflow)
+There is deliberately **no `cloud` input** — callers never carry cloud knowledge.
+
+#### Cloud resolution
+
+The target cloud comes from the **`DEPLOY_TARGET_CLOUD`** variable, read in the scope of the target GitHub Environment:
+
+- Allowed values: `azure`, `aws`, `gcp`.
+- An **environment-level** value overrides a **repository-level** one, so each environment can target a different cloud (e.g. dev on `azure`, staging on `aws`, prod on `gcp`), while a repository-level value acts as the default for environments that don't override it.
+- The variable is configured by the platform workflow alongside the other per-environment cloud parameters. An unset or invalid value **fails fast** with an error naming the variable and the environment.
+
+Examples — single-cloud setup (repository-level default):
+
+```bash
+gh variable set DEPLOY_TARGET_CLOUD --repo <org>/<app-repo> --body aws
+```
+
+Per-environment override (heterogeneous setup):
+
+```bash
+gh variable set DEPLOY_TARGET_CLOUD --repo <org>/<app-repo> --env dev --body azure
+gh variable set DEPLOY_TARGET_CLOUD --repo <org>/<app-repo> --env staging --body aws
+gh variable set DEPLOY_TARGET_CLOUD --repo <org>/<app-repo> --env prod --body aws
+```
+
+#### Deployment reports
+
+Every deployment leaves an audit record so the history of changes (who did what, how and when) can be reconstructed from either entry point — the workflow run or the project issue history. Both mechanisms are built from the same record, so they always carry the same tables and facts:
+
+| | Run summary | Report issue |
+|---|---|---|
+| `dev` | started + finished segments | — (fail-early CI loop, no issue noise) |
+| `staging` / `prod` | started + finished segments | opens at start, result posted as a comment |
+
+The start record carries environment, target cloud, image tag, trigger, initiating actor, commit, start timestamp and the run link; the result record carries the outcome, per-cloud job results, finish timestamp and the evidence link. Report issues are **never closed by automation**: they stay open, whatever the outcome, until a project member reviews the results and the linked evidence and closes the issue to acknowledge the deployment.
+
+#### Manual deployment
+
+Any environment can be deployed ad hoc from the Actions tab (**Deploy → Run workflow**) or with the CLI — the cloud is still resolved from the environment's configuration:
+
+```bash
+gh workflow run deploy.yml --repo <org>/<app-repo> \
+  -f environment=staging \
+  -f image_tag=sha-abc1234
+```
+
+### `deploy-azure.yml` — Azure implementation (App Service)
+
+Invoked only by the router. Steps, in order:
+
+1. **Preflight** — validates all required variables, failing fast **before any login or mutation** and naming every missing item.
+2. OIDC login via `azure/login@v3` (no long-lived credentials).
+3. `az webapp config appsettings set` — injects `APP_NAME`, `APP_ENV`, `IMAGE_TAG` **before** the container update so the new container starts with the right env vars already in place.
+4. `az webapp config container set` — points the Web App at the new image; the image change triggers an App Service restart automatically.
+5. **Readiness wait** — polls the per-instance state via the ARM REST API until every instance reports `READY`.
+6. Post-deploy validation (see [Post-deploy validation](#post-deploy-validation)).
+
+GitHub Environment variables consumed (set by the platform workflow):
 
 | Variable | Example |
 |----------|---------|
@@ -140,52 +210,52 @@ Reusable workflow (`workflow_call`). Called by `ci.yml` for dev on every push an
 | `AZURE_RESOURCE_GROUP` | `rg-myapp-dev` |
 | `AZURE_WEBAPP_NAME` | `app-myapp-dev` |
 
-#### Deploy steps (in this order)
+### `deploy-aws.yml` — AWS implementation (ECS Fargate)
 
-1. OIDC login via `azure/login@v3` using the variables above.
-2. `az webapp config appsettings set` — injects `APP_NAME`, `APP_ENV`,
-   `IMAGE_TAG`. Runs **before** the container update so the new container
-   starts with the right env vars already in place.
-3. `az webapp config container set` — points the existing Web App at the new
-   image (no infrastructure changes). Changing the image triggers an App
-   Service restart automatically; no explicit `az webapp restart` is needed.
-4. **Wait for the App Service to become healthy** — polls the per-instance
-   state via the ARM REST API (`Microsoft.Web/sites/.../instances`), up to
-   5 attempts with 5 s between, expecting every instance to report `READY`.
-   This gives the asynchronous container swap up to ~25 s to settle before
-   validation runs, and works the same way for dev, staging, and prod
-   regardless of network exposure.
-5. Validation — strategy depends on the environment's network exposure (see
-   below).
+Invoked only by the router. Steps, in order:
 
-#### Deploy validation strategy
+1. **Preflight** — validates all required variables, failing fast **before any login or mutation** and naming every missing item.
+2. OIDC authentication via `aws-actions/configure-aws-credentials@v4` (IAM role assumption, no long-lived keys).
+3. **Deployment controller detection** — the infrastructure provisions services with different ECS controllers, and the workflow branches on the service's `deploymentController.type`.
+4. Registers a new task definition revision carrying the image **and** the `APP_NAME` / `APP_ENV` / `IMAGE_TAG` env vars atomically (the ECS equivalent of Azure's settings-before-image ordering).
+5. Ships the revision per controller:
+   - **`ECS` (rolling)** — `aws ecs update-service`, then `aws ecs wait services-stable`.
+   - **`CODE_DEPLOY` (blue/green)** — creates an AWS CodeDeploy deployment whose AppSpec carries the new task definition and the container name/port read from it, then polls until the deployment succeeds, logging per interval the status, the lifecycle stage in progress, and the **live ALB traffic split** between the blue/green target groups. Failed or stopped deployments fail within one poll interval, surfacing CodeDeploy's error information.
+6. Post-deploy validation (see [Post-deploy validation](#post-deploy-validation)).
 
-The platform provisions environments with different network exposure:
+> **Watching a blue/green deployment**: the job log is the reference progress view. The ECS console's task-set traffic column lags until the task-set swap completes, and the two target groups alternate blue/green roles between deployments — the actual traffic split lives in the ALB listener weights, which the job log reports.
 
-| Environment | `public_network_access_enabled` | Validation method |
-|-------------|--------------------------------|-------------------|
-| `dev` | `true` — public endpoint open | HTTP: polls `GET /health` every 10 s, up to 3 min |
-| `staging` | `false` — private endpoint only | Control-plane: `az webapp show` (state) + `az webapp config show` (image tag) |
-| `prod` | `false` — private endpoint only | Control-plane: same as staging |
+GitHub Environment variables consumed (set by the platform workflow):
 
-The public hostname for staging/prod is unreachable from GitHub-hosted runners because the private endpoint disables public network access. The control-plane assertions confirm the App Service is `Running` and that `linuxFxVersion` contains the expected image tag — equivalent confidence without requiring network access to the app.
+| Variable | Example | Notes |
+|----------|---------|-------|
+| `AWS_ROLE_ARN` | `arn:aws:iam::<account>:role/<role>` | IAM role assumed via OIDC |
+| `AWS_REGION` | `eu-west-1` | |
+| `AWS_ECS_CLUSTER` | `myapp-dev` | |
+| `AWS_ECS_SERVICE` | `myapp-dev` | |
+| `AWS_APP_URL` | `https://myapp.dev.example.com` | required for `dev` only (HTTP smoke test) |
 
-To use HTTP validation against staging/prod, provision self-hosted runners inside the VNet and remove the `if: inputs.environment != 'dev'` condition in `deploy.yml`.
+The CodeDeploy resource names are **derived by naming convention** rather than configured — application `cd-<service>`, deployment group `<service>-dg` — so blue/green environments need no extra variables. A missing derived resource fails fast naming the expected values. Reading the live traffic weights needs `elasticloadbalancing:DescribeListeners` on the deploy role; without it the progress log degrades to status/stage reporting.
 
-**What the underlying infrastructure must provide for this to work as
-described:** each environment is expected to be an Azure App Service (Linux,
-container) with a User-Assigned Managed Identity, VNet integration, and a
-Private Endpoint for inbound traffic. The dev App Service is provisioned
-with `public_network_access_enabled = true` so its `<webapp>.azurewebsites.net`
-hostname is reachable from anywhere; staging and prod have
-`public_network_access_enabled = false`, leaving the Private Endpoint as the
-only ingress path — which is unreachable from GitHub-hosted runners (no
-fixed egress IP, not in the VNet). The App Service is configured with
-`health_check_path = "/health"` so the platform's own per-instance health
-probes substitute for the runner's HTTP smoke test on PE-only
-environments. Any infrastructure deviating from this — for example an App
-Service that closes public access in dev, or one without `/health` — needs
-matching changes to `deploy.yml`.
+### `deploy-gcp.yml` — GCP implementation
+
+Not implemented yet: the file exposes the shared `environment`/`image_tag` contract so the router can reference it, and fails fast with an actionable error if selected. The implementation (Cloud Run, OIDC via Workload Identity Federation, on par with the Azure and AWS workflows) is tracked in the issue backlog.
+
+### Post-deploy validation
+
+All three environments run **control-plane assertions** in every deployment; `dev` additionally gets an HTTP smoke test against the public endpoint. Control-plane assertions catch failures the readiness wait alone can miss — e.g. a rolled-back deployment that settles on the previous revision would still serve `/health` from the old version, but the image-tag assertion fails it.
+
+| Check | Azure | AWS |
+|-------|-------|-----|
+| Runtime state | App Service state == `Running` | Service `ACTIVE`; rolling: primary deployment rollout `COMPLETED`; blue/green: primary task set `STEADY_STATE` with running == desired |
+| Deployed image | `linuxFxVersion` contains the expected tag | The (task set's) task definition image contains the expected tag |
+| HTTP smoke test (`dev` only) | `GET /health` on `<webapp>.azurewebsites.net`, up to 3 min | `GET /health` on `AWS_APP_URL`, up to 3 min |
+
+The public hostname for staging/prod is unreachable from GitHub-hosted runners (private-only ingress), so the smoke test is dev-only; the control-plane assertions provide equivalent confidence without network access to the app. To use HTTP validation against staging/prod, provision self-hosted runners inside the private network and remove the environment condition on the smoke-test step.
+
+On AWS, a failed rollout additionally triggers a **diagnostics step** that dumps the service deployments, recent service events, stopped-task stop codes and container exit codes — and, for blue/green, the recent CodeDeploy deployments with their error information — so a failed deployment is diagnosable from the job log alone.
+
+**What the underlying infrastructure must provide:** each environment must expose the app's contract — the container listens on `PORT` (image default `8080`) as a **non-root** user, and serves `/health`. On Azure that means a Linux container Web App with `health_check_path = "/health"` and dev reachable publicly; on AWS an ECS Fargate service whose task definition, target groups and security groups speak port `8080`, with the CodeDeploy application/deployment group following the naming convention above for blue/green environments. Any infrastructure deviating from this needs matching changes to the deploy workflows.
 
 ---
 
@@ -195,8 +265,9 @@ matching changes to `deploy.yml`.
 
 When GitHub creates a repo from a template via the API, the new repo inherits the
 org/account default for `GITHUB_TOKEN` permissions, which is **read-only** unless
-changed. `ci.yml` needs `packages: write` to push to GHCR — that declaration in
-the workflow file is silently ignored if the repo default is read-only.
+changed. `ci.yml` needs `packages: write` to push to GHCR and `issues: write`
+for the deployment reports — those declarations in the workflow file are
+silently ignored if the repo default is read-only.
 
 **The platform workflow handles this for you.** Immediately after creating the
 repo from the template, the platform's `create-app-repo` job calls:
@@ -221,9 +292,14 @@ The per-repo PUT is the recommended path for fully automated provisioning becaus
 it doesn't rely on an org-wide default that could be changed by accident — but
 both work.
 
-### 2. OIDC federated credentials — handled automatically
+### 2. Cloud OIDC trust — handled automatically
 
-The platform workflow creates the service principal and its initial federated credentials scoped to the **platform repo**. For `deploy.yml` to authenticate from the **new app repo**, the same SP needs an additional federated credential per environment:
+The deploy workflows authenticate with **OIDC only** — no long-lived cloud
+credentials are stored anywhere. Each cloud must trust this repo's workflow
+identities, per environment; the platform workflow registers the trust for you
+when provisioning, so no operator action is required on the happy path.
+
+**Azure** — the service principal needs a federated credential per environment:
 
 | Environment | Subject claim |
 |-------------|---------------|
@@ -231,20 +307,8 @@ The platform workflow creates the service principal and its initial federated cr
 | `staging` | `repo:<org>/<app-repo>:environment:staging` |
 | `prod` | `repo:<org>/<app-repo>:environment:prod` |
 
-**The platform workflow registers all three for you** (see its
-`configure-federated-credentials` matrix job). No operator action is required
-on the happy path.
-
 If you ever need to add them by hand — for example to authorise an
-out-of-band branch or fork that the platform didn't provision — the snippets
-below are the same calls the workflow makes.
-
-#### How to add (Azure Portal)
-
-1. Open the service principal → **Certificates & secrets** → **Federated credentials**.
-2. Add a credential for each environment using the subject format above.
-
-#### How to add (CLI)
+out-of-band branch or fork that the platform didn't provision:
 
 ```bash
 APP_REPO="my-org/my-app"
@@ -290,6 +354,11 @@ done
 > `…All`) keeps the SP's blast radius to App Registrations it owns —
 > which, after step 1, is exactly one: itself.
 
+**AWS** — the IAM role in `AWS_ROLE_ARN` needs a trust policy on the GitHub
+OIDC provider (`token.actions.githubusercontent.com`) accepting the same
+per-environment subject claims (`repo:<org>/<app-repo>:environment:<env>`).
+The platform's `oidc-trust` job registers these when provisioning.
+
 ### 3. GHCR package must not already exist under a different repo
 
 GHCR ties each package permanently to the repository that first created it. If a
@@ -306,11 +375,12 @@ first:
 
 Go to **Package settings → Delete this package** before triggering `ci.yml`.
 
-### 4. GHCR package visibility and App Service pull access
+### 4. GHCR package visibility and runtime pull access
 
-App Service has no registry credentials by default. If the container image is
-private it will fail to start with `ImagePullUnauthorizedFailure`. There are three
-strategies; choose the one that matches your context.
+The cloud runtimes pull the image **without registry credentials** by default. If
+the container image is private the runtime will fail to start it (e.g. Azure App
+Service reports `ImagePullUnauthorizedFailure`; ECS tasks stop with a pull error).
+There are three strategies; choose the one that matches your context.
 
 ---
 
@@ -324,16 +394,16 @@ publicly pullable adds no meaningful exposure.
 `ci.yml` pushes an image to GHCR using `GITHUB_TOKEN`, GitHub links the package to
 the repository and applies the same visibility:
 
-- **Public repository** → package is **public** — App Service can pull without
+- **Public repository** → package is **public** — the runtimes can pull without
   credentials. No extra steps, no secrets required.
 - **Private repository** → package is **private** — use Strategy 2 or 3 below.
 
 ---
 
-#### Strategy 2 — Private GHCR package with stored credentials
+#### Strategy 2 — Private GHCR package with stored credentials (Azure example)
 
 App Service can pull a private GHCR image if registry credentials are passed when
-the container is configured. In `deploy.yml`, add three flags to the
+the container is configured. In `deploy-azure.yml`, add three flags to the
 `az webapp config container set` call:
 
 ```bash
@@ -345,7 +415,9 @@ az webapp config container set \
 
 The password must be a **classic PAT** with the `read:packages` scope (fine-grained
 PATs do not support GHCR). App Service persists the credentials and uses them for
-every subsequent pull — restarts, scale-out, slot swaps.
+every subsequent pull — restarts, scale-out, slot swaps. (The AWS equivalent is an
+ECS `repositoryCredentials` secret in Secrets Manager referenced from the task
+definition.)
 
 **Downsides to be aware of:**
 
@@ -361,39 +433,36 @@ operational cost of PAT rotation is acceptable.
 
 ---
 
-#### Strategy 3 — Azure Container Registry + Managed Identity (recommended for production)
+#### Strategy 3 — Cloud-native registry + workload identity (recommended for production)
 
 The cleanest production approach avoids credentials entirely by replacing GHCR with
-**Azure Container Registry (ACR)** and leveraging the user-assigned managed identity
-already provisioned by the platform.
-
-The platform grants the Web App's managed identity the `AcrPull` role on the ACR.
-App Service uses the MI to authenticate transparently — no PAT, no secret, nothing
-to rotate.
+the cloud's own registry and its identity-based pull authorization — **Azure
+Container Registry** pulled via the Web App's managed identity (`AcrPull` role), or
+**Amazon ECR** pulled via the ECS task execution role.
 
 The workflow change is small: replace the `docker login ghcr.io` / `docker push`
-steps with `az acr login` (authenticated via OIDC, same as the rest of the deploy)
-and push to `<registry>.azurecr.io/<app>:<tag>` instead.
+steps with the registry's OIDC-authenticated login and push to the registry's
+address instead; the deploy workflows then reference that address.
 
 ``` text
-ci.yml: build → az acr login → docker push <acr>/<app>:<tag>
-deploy.yml: az webapp config container set → <acr>/<app>:<tag>  (no --registry-* flags needed)
+ci.yml: build → registry login (OIDC) → docker push <registry>/<app>:<tag>
+deploy-*.yml: point the runtime at <registry>/<app>:<tag>  (no credentials needed)
 ```
 
 **What changes on the platform side:**
 
-- Terraform provisions an ACR resource and a role assignment (`AcrPull`) linking the
-  Web App's managed identity to the ACR.
-- The `AZURE_REGISTRY_NAME` (e.g. `crMyAppDev`) is added as a per-environment
-  GitHub variable alongside the existing ones.
+- Terraform provisions the registry and the role assignment linking the runtime's
+  identity to it (e.g. `AcrPull` for the Web App's managed identity, or the ECR
+  pull permissions on the ECS task execution role).
+- The registry address is added as a per-environment GitHub variable alongside
+  the existing ones.
 
 **Benefits over strategies 1 and 2:**
 
-- Zero credentials in the pipeline or in App Service configuration.
-- The MI token is managed by Azure and never expires.
+- Zero credentials in the pipeline or in the runtime configuration.
+- The identity tokens are managed by the cloud and never expire.
 - Works equally well for dev, staging, and prod with no changes to the workflow.
-- Integrates with Defender for Containers, geo-replication, and content trust if
-  needed.
+- Integrates with the cloud's image-scanning and policy tooling if needed.
 
 This is the recommended path for any workload moving beyond the workshop stage.
 
@@ -401,10 +470,10 @@ This is the recommended path for any workload moving beyond the workshop stage.
 
 #### Summary
 
-| | Public GHCR | Private GHCR + PAT | ACR + MI |
+| | Public GHCR | Private GHCR + credentials | Cloud registry + identity |
 |---|---|---|---|
 | Image visibility | Public | Private | Private |
-| Credentials required | None | Classic PAT (`read:packages`) | None (Managed Identity) |
+| Credentials required | None | Classic PAT (`read:packages`) | None (workload identity) |
 | Rotation required | — | Yes (manual) | No |
 | Platform changes needed | None | Workflow only | Terraform + workflow |
 | Recommended for | Workshops / OSS | Private repos (short-term) | Production |
@@ -430,19 +499,22 @@ recent `main` push.
 ``` text
 .
 ├── src/
-│   ├── index.js          # Express app
-│   └── index.test.js     # Jest unit tests
+│   ├── index.js            # Express app
+│   └── index.test.js       # Jest unit tests
 ├── .github/
 │   └── workflows/
-│       ├── ci.yml        # Build → test → push → deploy-dev
-│       ├── deploy.yml    # Reusable deploy (any env)
-│       └── release.yml   # Release validation → retag → promote to staging/prod
+│       ├── ci.yml          # Build → test → push → deploy-dev
+│       ├── release.yml     # Intent-checked release → retag → promote to staging/prod
+│       ├── deploy.yml      # Cloud-agnostic router + deployment reports
+│       ├── deploy-azure.yml# Azure implementation (App Service)
+│       ├── deploy-aws.yml  # AWS implementation (ECS Fargate, rolling + blue/green)
+│       └── deploy-gcp.yml  # GCP placeholder (fails fast until implemented)
 ├── Dockerfile
 ├── .dockerignore
 ├── .gitignore
 ├── LICENSE
-├── package.json          # Runtime deps + npm scripts (start, test)
-├── package-lock.json     # Locked dep tree (committed; npm ci uses it)
+├── package.json            # Runtime deps + npm scripts (start, test)
+├── package-lock.json       # Locked dep tree (committed; npm ci uses it)
 └── README.md
 ```
 
