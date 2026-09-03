@@ -147,11 +147,19 @@ jobs:
         if: inputs.environment != 'dev'
         run: |
           for i in 1 2 3 4 5 6 7 8 9 10 11 12; do
-            read -r STATE FX <<<"$(az webapp show \
+            # `az webapp show` often leaves siteConfig unpopulated; the image
+            # must be read via `az webapp config show`, as elsewhere in the
+            # pipeline.
+            STATE=$(az webapp show \
               --resource-group "${{ vars.AZURE_RESOURCE_GROUP }}" \
               --name            "${{ vars.AZURE_WEBAPP_NAME }}" \
               --slot            staging \
-              --query '[state, siteConfig.linuxFxVersion]' -o tsv)"
+              --query state -o tsv)
+            FX=$(az webapp config show \
+              --resource-group "${{ vars.AZURE_RESOURCE_GROUP }}" \
+              --name            "${{ vars.AZURE_WEBAPP_NAME }}" \
+              --slot            staging \
+              --query linuxFxVersion -o tsv)
             echo "  attempt ${i}: state=${STATE} image=${FX}"
             if [[ "${STATE}" == "Running" && "${FX}" == *"${{ inputs.image_tag }}"* ]]; then
               echo "Slot is Running with the expected image; ready to swap."
