@@ -194,7 +194,7 @@ gh workflow run deploy.yml --repo <org>/<app-repo> \
 Invoked only by the router. Steps, in order:
 
 1. **Preflight** — validates all required variables, failing fast **before any login or mutation** and naming every missing item.
-2. OIDC login via `azure/login@v3` (no long-lived credentials).
+2. OIDC login via `az login --federated-token` (no long-lived credentials), with a bounded retry: a federated credential registered moments before the first deploy can take a few minutes to become visible to Entra ID (`AADSTS700213`). Only that error is retried, up to ~5 minutes; any other login error fails immediately.
 3. `az webapp config appsettings set` — injects `APP_NAME`, `APP_ENV`, `IMAGE_TAG` **before** the container update so the new container starts with the right env vars already in place.
 4. `az webapp config container set` — points the Web App at the new image; the image change triggers an App Service restart automatically.
 5. **Readiness wait** — polls the per-instance state via the ARM REST API until every instance reports `READY`.
@@ -306,6 +306,11 @@ when provisioning, so no operator action is required on the happy path.
 | `dev` | `repo:<org>/<app-repo>:environment:dev` |
 | `staging` | `repo:<org>/<app-repo>:environment:staging` |
 | `prod` | `repo:<org>/<app-repo>:environment:prod` |
+
+A newly registered federated credential can take a few minutes to propagate;
+`deploy-azure.yml` retries the login on that specific condition, so the app's
+first deploy needs no manual re-run. AWS trust-policy changes apply
+immediately, so `deploy-aws.yml` has no equivalent.
 
 If you ever need to add them by hand — for example to authorise an
 out-of-band branch or fork that the platform didn't provision:
