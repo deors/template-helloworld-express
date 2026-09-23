@@ -86,13 +86,23 @@ creates when template-generating this repo, which is what the platform's
 push / workflow_dispatch
   └─ build-test-push
         ├─ npm ci && npm test
-        ├─ docker build & push → ghcr.io/<owner>/<repo>:sha-<short>
+        ├─ docker build
+        ├─ trivy image scan  (gate: fixable HIGH/CRITICAL → build fails, no push)
+        ├─ docker push → ghcr.io/<owner>/<repo>:sha-<short>
         └─ outputs: image_tag
   └─ deploy-dev  (calls deploy.yml with environment=dev)
         └─ resolve cloud → provider deploy → post-deploy validation
 ```
 
 `ci.yml` contains no cloud-specific logic and no cloud parameter — the dev environment's own configuration decides where it deploys. The entire run — including the dev deploy — must be green for the platform to consider bootstrap successful.
+
+**Image scan gate.** After the build and before the push, Trivy scans the image
+for OS and dependency vulnerabilities. Fixable **HIGH** or **CRITICAL** findings
+fail the build (unfixed ones are reported but do not block, since no rebuild
+could clear them). The scan table is published to the run's step summary and,
+as SARIF, to the repo's Security tab under the `trivy-image` category. Release
+promotions retag the already-scanned image by digest, so no rescan happens
+there.
 
 ### `release.yml` — Release & Promotion
 
@@ -265,9 +275,10 @@ On AWS, a failed rollout additionally triggers a **diagnostics step** that dumps
 
 When GitHub creates a repo from a template via the API, the new repo inherits the
 org/account default for `GITHUB_TOKEN` permissions, which is **read-only** unless
-changed. `ci.yml` needs `packages: write` to push to GHCR and `issues: write`
-for the deployment reports — those declarations in the workflow file are
-silently ignored if the repo default is read-only.
+changed. `ci.yml` needs `packages: write` to push to GHCR, `issues: write`
+for the deployment reports and `security-events: write` to upload the image
+scan results — those declarations in the workflow file are silently ignored if
+the repo default is read-only.
 
 **The platform workflow handles this for you.** Immediately after creating the
 repo from the template, the platform's `create-app-repo` job calls:
@@ -508,7 +519,7 @@ recent `main` push.
 │   └── index.test.js       # Jest unit tests
 ├── .github/
 │   └── workflows/
-│       ├── ci.yml          # Build → test → push → deploy-dev
+│       ├── ci.yml          # Build → test → scan → push → deploy-dev
 │       ├── release.yml     # Intent-checked release → retag → promote to staging/prod
 │       ├── deploy.yml      # Cloud-agnostic router + deployment reports
 │       ├── deploy-azure.yml# Azure implementation (App Service)
