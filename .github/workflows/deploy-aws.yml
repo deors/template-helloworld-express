@@ -343,18 +343,21 @@ jobs:
       # Post-deploy validation, mirroring the Azure workflow:
       #
       #   all environments — control-plane assertions. They catch failures the
-      #             stability wait alone can miss (e.g. a rolled-back
-      #             deployment that settles on the previous revision):
-      #               • service status is ACTIVE with all tasks running
-      #               • the deployment settled: primary deployment rollout
-      #                 COMPLETED (rolling) or primary task set STEADY_STATE
-      #                 (blue/green — `deployments` is null under CODE_DEPLOY,
-      #                 the state lives in `taskSets`)
-      #               • the deployed task definition runs the expected image tag
+      #       stability wait alone can miss (e.g. a rolled-back
+      #       deployment that settles on the previous revision):
+      #        • service status is ACTIVE with all tasks running
+      #        • the deployment settled: primary deployment rollout
+      #.         COMPLETED (rolling) or primary task set STEADY_STATE
+      #          (blue/green — `deployments` is null under CODE_DEPLOY,
+      #          the state lives in `taskSets`)
+      #        • the deployed task definition runs the expected image tag
       #
       #   dev only — additionally, an HTTP smoke test of /health over the
-      #             public endpoint (AWS_APP_URL). Staging/prod ingress is
-      #             private-only and unreachable from GitHub-hosted runners.
+      #       public endpoint (AWS_APP_URL). The ALB authenticates every
+      #       request, so the test first signs in as the environment's
+      #       test user (credentials in Secrets Manager) and then calls
+      #       /health with the ALB session cookie. Staging/prod ingress
+      #       is private-only and unreachable from GitHub-hosted runners.
       # -----------------------------------------------------------------------
 
       - name: Validate – control-plane assertions
@@ -433,24 +436,114 @@ jobs:
           echo "Control-plane validation passed."
 
       - name: Validate – HTTP smoke test (dev)
+        # The ALB authenticates every request (authenticate-cognito) and only
+        # accepts its own session cookie, so the test signs in through the
+        # hosted UI as the environment's test user first. The user and its
+        # secret are created by the infrastructure template; the secret id
+        # follows auth/<app>-<env>/<user>, with <app> taken from the service
+        # name (<app>-<env>).
         if: inputs.environment == 'dev'
+        env:
+          APP_URL: ${{ vars.AWS_APP_URL }}
+          AWS_ECS_SERVICE: ${{ vars.AWS_ECS_SERVICE }}
+          TARGET_ENV: ${{ inputs.environment }}
         run: |
-          APP_URL="${{ vars.AWS_APP_URL }}"
-          echo "Smoke-testing ${APP_URL}/health …"
+          set +x
+          APP_NAME="${AWS_ECS_SERVICE%-${TARGET_ENV}}"
+          SECRET_ID="auth/${APP_NAME}-${TARGET_ENV}/developer"
+          JAR="${RUNNER_TEMP}/smoke-cookies.txt"
+          trap 'rm -f "${JAR}"' EXIT
 
-          for i in $(seq 1 18); do
-            STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
-              --max-time 10 \
-              "${APP_URL}/health" || echo "000")
-            echo "  attempt ${i}: HTTP ${STATUS}"
-            if [ "${STATUS}" = "200" ]; then
-              echo "Health check passed."
+          echo "Smoke-testing ${APP_URL}/health, signing in as the '${TARGET_ENV}' test user" \
+            "(credentials: ${SECRET_ID}) …"
+
+          SECRET=$(aws secretsmanager get-secret-value \
+            --secret-id "${SECRET_ID}" --query SecretString --output text)
+          USERNAME=$(jq -r '.username // empty' <<<"${SECRET}")
+          PASSWORD=$(jq -r '.password // empty' <<<"${SECRET}")
+          unset SECRET
+          if [[ -z "${USERNAME}" || -z "${PASSWORD}" ]]; then
+            echo "::error::Secret ${SECRET_ID} does not contain both 'username' and 'password'."
+            exit 1
+          fi
+          echo "::add-mask::${PASSWORD}"
+
+          # One attempt = the whole hosted sign-in flow. Prints the step reached and the
+          # status (never bodies, cookies or credentials) and returns non-zero on any
+          # mismatch so the caller can retry.
+          attempt() {
+            local out status location login_url callback csrf
+            rm -f "${JAR}"
+
+            # 1. Anonymous request: the ALB redirects to the Cognito authorize endpoint.
+            out=$(curl -sS --max-time 15 -c "${JAR}" -b "${JAR}" -o /dev/null \
+                  -w '%{http_code} %{redirect_url}' "${APP_URL}/health") || out="000 "
+            status=${out%% *}; location=${out#* }
+            if [[ "${status}" != "302" || "${location}" != *"/oauth2/authorize"* ]]; then
+              echo "  step 1 (GET /health, expect 302 to authorize): HTTP ${status} ${location%%\?*}"
+              return 1
+            fi
+
+            # 2. Authorize redirects to the hosted login page.
+            out=$(curl -sS --max-time 15 -c "${JAR}" -b "${JAR}" -o /dev/null \
+                  -w '%{http_code} %{redirect_url}' "${location}") || out="000 "
+            status=${out%% *}; login_url=${out#* }
+            if [[ "${status}" != "302" || "${login_url}" != *"/login"* ]]; then
+              echo "  step 2 (authorize, expect 302 to login): HTTP ${status} ${login_url%%\?*}"
+              return 1
+            fi
+
+            # 3. The login page sets the CSRF token as the XSRF-TOKEN cookie.
+            status=$(curl -sS --max-time 15 -c "${JAR}" -b "${JAR}" -o /dev/null \
+                     -w '%{http_code}' "${login_url}") || status="000"
+            csrf=$(awk '$6 == "XSRF-TOKEN" { v = $7 } END { print v }' "${JAR}")
+            if [[ "${status}" != "200" || -z "${csrf}" ]]; then
+              echo "  step 3 (login page, expect 200 with XSRF-TOKEN): HTTP ${status}"
+              return 1
+            fi
+
+            # 4. Sign in: success is a redirect to the ALB callback with an auth code.
+            out=$(curl -sS --max-time 15 -c "${JAR}" -b "${JAR}" -o /dev/null \
+                  -w '%{http_code} %{redirect_url}' \
+                  --data-urlencode "_csrf=${csrf}" \
+                  --data-urlencode "username=${USERNAME}" \
+                  --data-urlencode "password=${PASSWORD}" \
+                  "${login_url}") || out="000 "
+            status=${out%% *}; callback=${out#* }
+            if [[ "${status}" != "302" || "${callback}" != *"/oauth2/idpresponse?code="* ]]; then
+              echo "  step 4 (sign-in, expect 302 to /oauth2/idpresponse): HTTP ${status} ${callback%%\?*}" \
+                "— a 200 here means the credentials were rejected"
+              return 1
+            fi
+
+            # 5. The callback sets the ALB session cookie and lands on /health.
+            status=$(curl -sS --max-time 20 -L --max-redirs 5 -c "${JAR}" -b "${JAR}" \
+                     -o /dev/null -w '%{http_code}' "${callback}") || status="000"
+            if [[ "${status}" != "200" ]] || ! grep -q 'AWSELBAuthSessionCookie' "${JAR}"; then
+              echo "  step 5 (callback → /health, expect 200 with ALB session cookie): HTTP ${status}"
+              return 1
+            fi
+            return 0
+          }
+
+          DEADLINE=$(( SECONDS + 180 ))
+          ATTEMPT=0
+          while :; do
+            ATTEMPT=$(( ATTEMPT + 1 ))
+            echo "attempt ${ATTEMPT}:"
+            if attempt; then
+              echo "Health check passed: signed in as '${USERNAME}' and /health returned 200."
               exit 0
+            fi
+            if (( SECONDS >= DEADLINE )); then
+              break
             fi
             sleep 10
           done
 
-          echo "Health check timed out after 3 minutes."
+          echo "::error::Health check failed after ${ATTEMPT} attempts (3-minute budget):" \
+            "the sign-in flow did not end with HTTP 200 from /health. See the step" \
+            "reached in each attempt above."
           exit 1
 
       - name: Confirm deployed version

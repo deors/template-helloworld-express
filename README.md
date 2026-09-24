@@ -243,7 +243,7 @@ GitHub Environment variables consumed (set by the platform workflow):
 | `AWS_REGION` | `eu-west-1` | |
 | `AWS_ECS_CLUSTER` | `myapp-dev` | |
 | `AWS_ECS_SERVICE` | `myapp-dev` | |
-| `AWS_APP_URL` | `https://myapp.dev.example.com` | required for `dev` only (HTTP smoke test) |
+| `AWS_APP_URL` | `https://myapp.dev.example.com` | required for `dev` only (HTTP smoke test, which signs in with the environment's test user — credentials in Secrets Manager) |
 
 The CodeDeploy resource names are **derived by naming convention** rather than configured — application `cd-<service>`, deployment group `<service>-dg` — so blue/green environments need no extra variables. A missing derived resource fails fast naming the expected values. Reading the live traffic weights needs `elasticloadbalancing:DescribeListeners` on the deploy role; without it the progress log degrades to status/stage reporting.
 
@@ -259,13 +259,13 @@ All three environments run **control-plane assertions** in every deployment; `de
 |-------|-------|-----|
 | Runtime state | App Service state == `Running` | Service `ACTIVE`; rolling: primary deployment rollout `COMPLETED`; blue/green: primary task set `STEADY_STATE` with running == desired |
 | Deployed image | `linuxFxVersion` contains the expected tag | The (task set's) task definition image contains the expected tag |
-| HTTP smoke test (`dev` only) | `GET /health` on `<webapp>.azurewebsites.net`, up to 3 min | `GET /health` on `AWS_APP_URL`, up to 3 min |
+| HTTP smoke test (`dev` only) | `GET /health` on `<webapp>.azurewebsites.net`, up to 3 min | Sign in through the ALB with the environment's test user (credentials in Secrets Manager), then `GET /health` on `AWS_APP_URL`, up to 3 min |
 
 The public hostname for staging/prod is unreachable from GitHub-hosted runners (private-only ingress), so the smoke test is dev-only; the control-plane assertions provide equivalent confidence without network access to the app. To use HTTP validation against staging/prod, provision self-hosted runners inside the private network and remove the environment condition on the smoke-test step.
 
 On AWS, a failed rollout additionally triggers a **diagnostics step** that dumps the service deployments, recent service events, stopped-task stop codes and container exit codes — and, for blue/green, the recent CodeDeploy deployments with their error information — so a failed deployment is diagnosable from the job log alone.
 
-**What the underlying infrastructure must provide:** each environment must expose the app's contract — the container listens on `PORT` (image default `8080`) as a **non-root** user, and serves `/health`. On Azure that means a Linux container Web App with `health_check_path = "/health"` and dev reachable publicly; on AWS an ECS Fargate service whose task definition, target groups and security groups speak port `8080`, with the CodeDeploy application/deployment group following the naming convention above for blue/green environments. Any infrastructure deviating from this needs matching changes to the deploy workflows.
+**What the underlying infrastructure must provide:** each environment must expose the app's contract — the container listens on `PORT` (image default `8080`) as a **non-root** user, and serves `/health`. On Azure that means a Linux container Web App with `health_check_path = "/health"` and dev reachable publicly; on AWS an ECS Fargate service whose task definition, target groups and security groups speak port `8080`, with the CodeDeploy application/deployment group following the naming convention above for blue/green environments, and — for `dev` — the deploy role allowed to read the test user's secret (`auth/<app>-dev/*`) that the smoke test signs in with. Any infrastructure deviating from this needs matching changes to the deploy workflows.
 
 ---
 
