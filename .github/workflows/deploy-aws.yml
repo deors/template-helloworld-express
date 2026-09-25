@@ -453,6 +453,11 @@ jobs:
           TARGET_ENV: ${{ inputs.environment }}
         run: |
           set +x
+          # Per-request timeouts, shared with the Azure smoke test: plain requests
+          # to the app or the identity provider, and the one call that follows
+          # the callback redirect chain.
+          CURL_TIMEOUT=15
+          CURL_REDIRECT_TIMEOUT=30
           APP_NAME="${AWS_ECS_SERVICE%-${TARGET_ENV}}"
           SECRET_ID="auth/${APP_NAME}-${TARGET_ENV}/developer"
           JAR="${RUNNER_TEMP}/smoke-cookies.txt"
@@ -480,7 +485,7 @@ jobs:
             rm -f "${JAR}"
 
             # 1. Anonymous request: the ALB redirects to the Cognito authorize endpoint.
-            out=$(curl -sS --max-time 15 -c "${JAR}" -b "${JAR}" -o /dev/null \
+            out=$(curl -sS --max-time "${CURL_TIMEOUT}" -c "${JAR}" -b "${JAR}" -o /dev/null \
                   -w '%{http_code} %{redirect_url}' "${APP_URL}/health") || out="000 "
             status=${out%% *}; location=${out#* }
             if [[ "${status}" != "302" || "${location}" != *"/oauth2/authorize"* ]]; then
@@ -489,7 +494,7 @@ jobs:
             fi
 
             # 2. Authorize redirects to the hosted login page.
-            out=$(curl -sS --max-time 15 -c "${JAR}" -b "${JAR}" -o /dev/null \
+            out=$(curl -sS --max-time "${CURL_TIMEOUT}" -c "${JAR}" -b "${JAR}" -o /dev/null \
                   -w '%{http_code} %{redirect_url}' "${location}") || out="000 "
             status=${out%% *}; login_url=${out#* }
             if [[ "${status}" != "302" || "${login_url}" != *"/login"* ]]; then
@@ -498,7 +503,7 @@ jobs:
             fi
 
             # 3. The login page sets the CSRF token as the XSRF-TOKEN cookie.
-            status=$(curl -sS --max-time 15 -c "${JAR}" -b "${JAR}" -o /dev/null \
+            status=$(curl -sS --max-time "${CURL_TIMEOUT}" -c "${JAR}" -b "${JAR}" -o /dev/null \
                      -w '%{http_code}' "${login_url}") || status="000"
             csrf=$(awk '$6 == "XSRF-TOKEN" { v = $7 } END { print v }' "${JAR}")
             if [[ "${status}" != "200" || -z "${csrf}" ]]; then
@@ -507,7 +512,7 @@ jobs:
             fi
 
             # 4. Sign in: success is a redirect to the ALB callback with an auth code.
-            out=$(curl -sS --max-time 15 -c "${JAR}" -b "${JAR}" -o /dev/null \
+            out=$(curl -sS --max-time "${CURL_TIMEOUT}" -c "${JAR}" -b "${JAR}" -o /dev/null \
                   -w '%{http_code} %{redirect_url}' \
                   --data-urlencode "_csrf=${csrf}" \
                   --data-urlencode "username=${USERNAME}" \
@@ -521,7 +526,7 @@ jobs:
             fi
 
             # 5. The callback sets the ALB session cookie and lands on /health.
-            status=$(curl -sS --max-time 20 -L --max-redirs 5 -c "${JAR}" -b "${JAR}" \
+            status=$(curl -sS --max-time "${CURL_REDIRECT_TIMEOUT}" -L --max-redirs 5 -c "${JAR}" -b "${JAR}" \
                      -o /dev/null -w '%{http_code}' "${callback}") || status="000"
             if [[ "${status}" != "200" ]] || ! grep -q 'AWSELBAuthSessionCookie' "${JAR}"; then
               echo "  step 5 (callback → /health, expect 200 with ALB session cookie): HTTP ${status}"
