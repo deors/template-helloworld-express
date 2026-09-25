@@ -672,12 +672,14 @@ jobs:
             MODE="controller CODE_DEPLOY (blue/green, deployment ${DEPLOYMENT_ID})"
             read -r CP_START CP_END CP_STATUS <<<"$(aws deploy get-deployment --deployment-id "${DEPLOYMENT_ID}" \
               --query 'deploymentInfo.[createTime, completeTime, status]' --output text 2>/dev/null || echo "unavailable unavailable unavailable")"
-            CONTROL="blue/green deployment started ${CP_START} · completed ${CP_END} · status ${CP_STATUS}"
+            read -r RUNNING DESIRED <<<"$(aws ecs describe-services --cluster "${CLUSTER}" --services "${SERVICE}" \
+              --query "services[0].taskSets[?status=='PRIMARY'] | [0].[runningCount, computedDesiredCount]" --output text 2>/dev/null || echo "? ?")"
+            CONTROL="blue/green deployment started ${CP_START} · completed ${CP_END} · status ${CP_STATUS} · ${RUNNING}/${DESIRED} task(s) running"
           else
             MODE="controller ECS (rolling)"
-            read -r CP_START CP_END CP_STATUS <<<"$(aws ecs describe-services --cluster "${CLUSTER}" --services "${SERVICE}" \
-              --query "services[0].deployments[?status=='PRIMARY'] | [0].[createdAt, updatedAt, rolloutState]" --output text 2>/dev/null || echo "unavailable unavailable unavailable")"
-            CONTROL="rolling deployment started ${CP_START} · completed ${CP_END} · status ${CP_STATUS}"
+            read -r CP_START CP_END CP_STATUS RUNNING DESIRED <<<"$(aws ecs describe-services --cluster "${CLUSTER}" --services "${SERVICE}" \
+              --query "services[0].deployments[?status=='PRIMARY'] | [0].[createdAt, updatedAt, rolloutState, runningCount, desiredCount]" --output text 2>/dev/null || echo "unavailable unavailable unavailable ? ?")"
+            CONTROL="rolling deployment started ${CP_START} · completed ${CP_END} · status ${CP_STATUS} · ${RUNNING}/${DESIRED} task(s) running"
           fi
           LOCATION="region ${AWS_REGION} · cluster ${CLUSTER} · service ${SERVICE} · task definition ${TASKDEF_ARN##*/} · ${MODE}"
           if [[ "${TARGET_ENV}" == "dev" ]]; then
