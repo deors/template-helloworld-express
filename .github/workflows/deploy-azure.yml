@@ -572,7 +572,7 @@ jobs:
             local title="$1" r label value
             echo "=== ${title} ==="
             {
-              echo "## ${title}"; echo; echo "| Field | Value |"; echo "|---|---|"
+              echo "## ${title}"; echo; echo "|   |   |"; echo "|---|---|"
             } >> "$GITHUB_STEP_SUMMARY"
             for r in "${ROWS[@]}"; do
               label="${r%%|*}"; value="${r#*|}"
@@ -584,6 +584,8 @@ jobs:
 
           RG="${AZURE_RESOURCE_GROUP}"; APP="${AZURE_WEBAPP_NAME}"
           DEPLOYED=$(az webapp config show -g "${RG}" -n "${APP}" --query linuxFxVersion -o tsv 2>/dev/null || echo "unavailable")
+          # App Service prefixes the container image with DOCKER|.
+          DEPLOYED="${DEPLOYED#DOCKER|}"
           read -r HOST LAST_MODIFIED <<<"$(az webapp show -g "${RG}" -n "${APP}" \
             --query '[defaultHostName, lastModifiedTimeUtc]' -o tsv 2>/dev/null || echo "${APP}.azurewebsites.net unavailable")"
           SETTINGS=$(az webapp config appsettings list -g "${RG}" -n "${APP}" \
