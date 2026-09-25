@@ -476,20 +476,70 @@ jobs:
             exit 1
           fi
           echo "::add-mask::${PASSWORD}"
+          BASE_URL="${APP_URL}"
+          CREDENTIALS="Secrets Manager secret ${SECRET_ID}"
+          IDENTITY="test user '${USERNAME}'"
 
-          # One attempt = the whole hosted sign-in flow. Prints the step reached and the
-          # status (never bodies, cookies or credentials) and returns non-zero on any
+          # Reporting: every check records what it asked for and what it observed; the
+          # same block is rendered on success and on failure, to the log and the step
+          # summary. Credentials, tokens and cookies are never part of it.
+          BUDGET=180
+          CHECKS=(); LAST_STEP=""; LAST_OBSERVED=""
+          record() { CHECKS+=("$1|$2|$3|$4"); }          # request | expected | observed | identity
+          fail_at() { LAST_STEP="$1"; LAST_OBSERVED="$2"; echo "  ${1}: ${2}"; }
+          report() {
+            local outcome="$1" title line i=0 c req exp obs who
+            if [[ "${outcome}" == "passed" ]]; then
+              title="Smoke test passed on attempt ${ATTEMPT} after ${SECONDS} s"
+            else
+              title="Smoke test failed after ${ATTEMPT} attempt(s) and ${SECONDS} s (budget ${BUDGET} s)"
+            fi
+            {
+              echo "${title}"
+              echo "  Base URL    : ${BASE_URL}"
+              echo "  Credentials : ${CREDENTIALS}"
+              echo "  Identity    : ${IDENTITY}"
+              [[ "${outcome}" == "passed" ]] || echo "  Last step   : ${LAST_STEP} — observed ${LAST_OBSERVED}"
+              echo "  Checks (last attempt):"
+              for c in "${CHECKS[@]}"; do
+                IFS='|' read -r req exp obs who <<<"${c}"; i=$(( i + 1 ))
+                echo "    ${i}. ${req} → expected ${exp}, observed ${obs} · ${who}"
+              done
+            }
+            {
+              echo "## Dev smoke test"
+              echo
+              echo "**${title}**"
+              echo
+              echo "- Base URL: \`${BASE_URL}\`"
+              echo "- Credentials: ${CREDENTIALS}"
+              echo "- Identity: ${IDENTITY}"
+              [[ "${outcome}" == "passed" ]] || echo "- Last step reached: ${LAST_STEP} — observed ${LAST_OBSERVED}"
+              echo
+              echo "| # | Check | Expected | Observed | Identity |"
+              echo "|---|---|---|---|---|"
+              i=0
+              for c in "${CHECKS[@]}"; do
+                IFS='|' read -r req exp obs who <<<"${c}"; i=$(( i + 1 ))
+                echo "| ${i} | ${req} | ${exp} | ${obs} | ${who} |"
+              done
+              echo
+            } >> "${GITHUB_STEP_SUMMARY}"
+          }
+
+          # One attempt = the whole hosted sign-in flow; returns non-zero on any
           # mismatch so the caller can retry.
           attempt() {
             local out status location login_url callback csrf
-            rm -f "${JAR}"
+            rm -f "${JAR}"; CHECKS=()
 
             # 1. Anonymous request: the ALB redirects to the Cognito authorize endpoint.
             out=$(curl -sS --max-time "${CURL_TIMEOUT}" -c "${JAR}" -b "${JAR}" -o /dev/null \
                   -w '%{http_code} %{redirect_url}' "${APP_URL}/health") || out="000 "
             status=${out%% *}; location=${out#* }
+            record "GET /health" "302 to /oauth2/authorize" "HTTP ${status}${location:+ to ${location%%\?*}}" "anonymous"
             if [[ "${status}" != "302" || "${location}" != *"/oauth2/authorize"* ]]; then
-              echo "  step 1 (GET /health, expect 302 to authorize): HTTP ${status} ${location%%\?*}"
+              fail_at "step 1 (GET /health, expect 302 to authorize)" "HTTP ${status}${location:+ to ${location%%\?*}}"
               return 1
             fi
 
@@ -497,8 +547,9 @@ jobs:
             out=$(curl -sS --max-time "${CURL_TIMEOUT}" -c "${JAR}" -b "${JAR}" -o /dev/null \
                   -w '%{http_code} %{redirect_url}' "${location}") || out="000 "
             status=${out%% *}; login_url=${out#* }
+            record "GET /oauth2/authorize" "302 to /login" "HTTP ${status}${login_url:+ to ${login_url%%\?*}}" "anonymous"
             if [[ "${status}" != "302" || "${login_url}" != *"/login"* ]]; then
-              echo "  step 2 (authorize, expect 302 to login): HTTP ${status} ${login_url%%\?*}"
+              fail_at "step 2 (authorize, expect 302 to login)" "HTTP ${status}${login_url:+ to ${login_url%%\?*}}"
               return 1
             fi
 
@@ -506,8 +557,10 @@ jobs:
             status=$(curl -sS --max-time "${CURL_TIMEOUT}" -c "${JAR}" -b "${JAR}" -o /dev/null \
                      -w '%{http_code}' "${login_url}") || status="000"
             csrf=$(awk '$6 == "XSRF-TOKEN" { v = $7 } END { print v }' "${JAR}")
+            local xsrf="missing"; [[ -n "${csrf}" ]] && xsrf="present"
+            record "GET /login" "200 with XSRF-TOKEN cookie" "HTTP ${status}, XSRF-TOKEN ${xsrf}" "anonymous"
             if [[ "${status}" != "200" || -z "${csrf}" ]]; then
-              echo "  step 3 (login page, expect 200 with XSRF-TOKEN): HTTP ${status}"
+              fail_at "step 3 (login page, expect 200 with XSRF-TOKEN)" "HTTP ${status}, XSRF-TOKEN ${xsrf}"
               return 1
             fi
 
@@ -519,29 +572,32 @@ jobs:
                   --data-urlencode "password=${PASSWORD}" \
                   "${login_url}") || out="000 "
             status=${out%% *}; callback=${out#* }
+            record "POST /login" "302 to /oauth2/idpresponse" "HTTP ${status}${callback:+ to ${callback%%\?*}}" "${IDENTITY}"
             if [[ "${status}" != "302" || "${callback}" != *"/oauth2/idpresponse?code="* ]]; then
-              echo "  step 4 (sign-in, expect 302 to /oauth2/idpresponse): HTTP ${status} ${callback%%\?*}" \
-                "— a 200 here means the credentials were rejected"
+              fail_at "step 4 (sign-in, expect 302 to /oauth2/idpresponse)" \
+                "HTTP ${status}${callback:+ to ${callback%%\?*}} — a 200 here means the credentials were rejected"
               return 1
             fi
 
             # 5. The callback sets the ALB session cookie and lands on /health.
             status=$(curl -sS --max-time "${CURL_REDIRECT_TIMEOUT}" -L --max-redirs 5 -c "${JAR}" -b "${JAR}" \
                      -o /dev/null -w '%{http_code}' "${callback}") || status="000"
-            if [[ "${status}" != "200" ]] || ! grep -q 'AWSELBAuthSessionCookie' "${JAR}"; then
-              echo "  step 5 (callback → /health, expect 200 with ALB session cookie): HTTP ${status}"
+            local cookie="missing"; grep -q 'AWSELBAuthSessionCookie' "${JAR}" && cookie="present"
+            record "GET /oauth2/idpresponse → /health" "200 with ALB session cookie" "HTTP ${status}, session cookie ${cookie}" "${IDENTITY}"
+            if [[ "${status}" != "200" || "${cookie}" != "present" ]]; then
+              fail_at "step 5 (callback → /health, expect 200 with ALB session cookie)" "HTTP ${status}, session cookie ${cookie}"
               return 1
             fi
             return 0
           }
 
-          DEADLINE=$(( SECONDS + 180 ))
+          DEADLINE=$(( SECONDS + BUDGET ))
           ATTEMPT=0
           while :; do
             ATTEMPT=$(( ATTEMPT + 1 ))
             echo "attempt ${ATTEMPT}:"
             if attempt; then
-              echo "Health check passed: signed in as '${USERNAME}' and /health returned 200."
+              report passed
               exit 0
             fi
             if (( SECONDS >= DEADLINE )); then
@@ -550,9 +606,9 @@ jobs:
             sleep 10
           done
 
-          echo "::error::Health check failed after ${ATTEMPT} attempts (3-minute budget):" \
-            "the sign-in flow did not end with HTTP 200 from /health. See the step" \
-            "reached in each attempt above."
+          report failed
+          echo "::error::Smoke test failed after ${ATTEMPT} attempt(s) within the ${BUDGET} s budget;" \
+            "last step reached: ${LAST_STEP}, observed: ${LAST_OBSERVED}."
           exit 1
 
       - name: Confirm deployed version
