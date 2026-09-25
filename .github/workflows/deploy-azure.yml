@@ -397,6 +397,9 @@ jobs:
           AZURE_WEBAPP_NAME: ${{ vars.AZURE_WEBAPP_NAME }}
         run: |
           set +x
+          # Per-request timeout, shared with the AWS smoke test, for plain requests
+          # to the app or the identity provider (no request here follows redirects).
+          CURL_TIMEOUT=15
           WEBAPP_URL="https://${AZURE_WEBAPP_NAME}.azurewebsites.net"
           # Vault name: kv-<app>-<env>, cut to 24 characters, no trailing hyphen.
           VAULT="kv-${AZURE_WEBAPP_NAME#app-}"
@@ -428,7 +431,7 @@ jobs:
             local status token
 
             # 1. The health path is excluded from authentication.
-            status=$(curl -sS --max-time 10 -o /dev/null -w '%{http_code}' \
+            status=$(curl -sS --max-time "${CURL_TIMEOUT}" -o /dev/null -w '%{http_code}' \
                      "${WEBAPP_URL}/health") || status="000"
             if [[ "${status}" != "200" ]]; then
               echo "  step 1 (GET /health anonymously, expect 200): HTTP ${status}"
@@ -436,7 +439,7 @@ jobs:
             fi
 
             # 2. Everything else is gated: an API client without a token gets 401.
-            status=$(curl -sS --max-time 10 -o /dev/null -w '%{http_code}' \
+            status=$(curl -sS --max-time "${CURL_TIMEOUT}" -o /dev/null -w '%{http_code}' \
                      -H 'Accept: application/json' "${WEBAPP_URL}/") || status="000"
             if [[ "${status}" != "401" ]]; then
               echo "  step 2 (GET / anonymously, expect 401): HTTP ${status}"
@@ -444,7 +447,7 @@ jobs:
             fi
 
             # 3. Client-credentials token for the test client, then GET / with it.
-            token=$(curl -sS --max-time 15 -X POST "${TOKEN_URL}" \
+            token=$(curl -sS --max-time "${CURL_TIMEOUT}" -X POST "${TOKEN_URL}" \
                       --data-urlencode "grant_type=client_credentials" \
                       --data-urlencode "client_id=${CLIENT_ID}" \
                       --data-urlencode "client_secret=${CLIENT_SECRET}" \
@@ -456,7 +459,7 @@ jobs:
               return 1
             fi
             echo "::add-mask::${token}"
-            status=$(curl -sS --max-time 10 -o /dev/null -w '%{http_code}' \
+            status=$(curl -sS --max-time "${CURL_TIMEOUT}" -o /dev/null -w '%{http_code}' \
                      -H "Authorization: Bearer ${token}" "${WEBAPP_URL}/") || status="000"
             if [[ "${status}" != "200" ]]; then
               echo "  step 3 (GET / with bearer token, expect 200): HTTP ${status}"
