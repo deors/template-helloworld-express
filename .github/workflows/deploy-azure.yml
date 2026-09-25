@@ -423,26 +423,78 @@ jobs:
           fi
           echo "::add-mask::${CLIENT_SECRET}"
           TOKEN_URL="https://login.microsoftonline.com/${TENANT_ID}/oauth2/v2.0/token"
+          BASE_URL="${WEBAPP_URL}"
+          CREDENTIALS="Key Vault ${VAULT} (e2e-tenant-id, e2e-client-id, e2e-client-secret, e2e-scope)"
+          IDENTITY="test client '${CLIENT_ID}'"
 
-          # One attempt = the three checks in order. Prints the step reached and the
-          # status (never bodies, tokens or secrets) and returns non-zero on any
-          # mismatch so the caller can retry.
+          # Reporting: every check records what it asked for and what it observed; the
+          # same block is rendered on success and on failure, to the log and the step
+          # summary. Credentials, tokens and cookies are never part of it.
+          BUDGET=180
+          CHECKS=(); LAST_STEP=""; LAST_OBSERVED=""
+          record() { CHECKS+=("$1|$2|$3|$4"); }          # request | expected | observed | identity
+          fail_at() { LAST_STEP="$1"; LAST_OBSERVED="$2"; echo "  ${1}: ${2}"; }
+          report() {
+            local outcome="$1" title line i=0 c req exp obs who
+            if [[ "${outcome}" == "passed" ]]; then
+              title="Smoke test passed on attempt ${ATTEMPT} after ${SECONDS} s"
+            else
+              title="Smoke test failed after ${ATTEMPT} attempt(s) and ${SECONDS} s (budget ${BUDGET} s)"
+            fi
+            {
+              echo "${title}"
+              echo "  Base URL    : ${BASE_URL}"
+              echo "  Credentials : ${CREDENTIALS}"
+              echo "  Identity    : ${IDENTITY}"
+              [[ "${outcome}" == "passed" ]] || echo "  Last step   : ${LAST_STEP} — observed ${LAST_OBSERVED}"
+              echo "  Checks (last attempt):"
+              for c in "${CHECKS[@]}"; do
+                IFS='|' read -r req exp obs who <<<"${c}"; i=$(( i + 1 ))
+                echo "    ${i}. ${req} → expected ${exp}, observed ${obs} · ${who}"
+              done
+            }
+            {
+              echo "## Dev smoke test"
+              echo
+              echo "**${title}**"
+              echo
+              echo "- Base URL: \`${BASE_URL}\`"
+              echo "- Credentials: ${CREDENTIALS}"
+              echo "- Identity: ${IDENTITY}"
+              [[ "${outcome}" == "passed" ]] || echo "- Last step reached: ${LAST_STEP} — observed ${LAST_OBSERVED}"
+              echo
+              echo "| # | Check | Expected | Observed | Identity |"
+              echo "|---|---|---|---|---|"
+              i=0
+              for c in "${CHECKS[@]}"; do
+                IFS='|' read -r req exp obs who <<<"${c}"; i=$(( i + 1 ))
+                echo "| ${i} | ${req} | ${exp} | ${obs} | ${who} |"
+              done
+              echo
+            } >> "${GITHUB_STEP_SUMMARY}"
+          }
+
+          # One attempt = the checks in order; returns non-zero on any mismatch so the
+          # caller can retry.
           attempt() {
             local status token
+            CHECKS=()
 
             # 1. The health path is excluded from authentication.
             status=$(curl -sS --max-time "${CURL_TIMEOUT}" -o /dev/null -w '%{http_code}' \
                      "${WEBAPP_URL}/health") || status="000"
+            record "GET /health" "200" "HTTP ${status}" "anonymous"
             if [[ "${status}" != "200" ]]; then
-              echo "  step 1 (GET /health anonymously, expect 200): HTTP ${status}"
+              fail_at "step 1 (GET /health anonymously, expect 200)" "HTTP ${status}"
               return 1
             fi
 
             # 2. Everything else is gated: an API client without a token gets 401.
             status=$(curl -sS --max-time "${CURL_TIMEOUT}" -o /dev/null -w '%{http_code}' \
                      -H 'Accept: application/json' "${WEBAPP_URL}/") || status="000"
+            record "GET /" "401" "HTTP ${status}" "anonymous"
             if [[ "${status}" != "401" ]]; then
-              echo "  step 2 (GET / anonymously, expect 401): HTTP ${status}"
+              fail_at "step 2 (GET / anonymously, expect 401)" "HTTP ${status}"
               return 1
             fi
 
@@ -453,29 +505,31 @@ jobs:
                       --data-urlencode "client_secret=${CLIENT_SECRET}" \
                       --data-urlencode "scope=${SCOPE}" \
                     | jq -r '.access_token // empty') || token=""
+            local issued="not issued"; [[ -n "${token}" ]] && issued="issued"
+            record "POST token endpoint" "access token issued" "token ${issued}" "${IDENTITY}"
             if [[ -z "${token}" ]]; then
-              echo "  step 3 (token request for the test client): no access token returned" \
-                "— check the e2e-* secrets and the client's credentials"
+              fail_at "step 3 (token request for the test client)" \
+                "no access token returned — check the e2e-* secrets and the client's credentials"
               return 1
             fi
             echo "::add-mask::${token}"
             status=$(curl -sS --max-time "${CURL_TIMEOUT}" -o /dev/null -w '%{http_code}' \
                      -H "Authorization: Bearer ${token}" "${WEBAPP_URL}/") || status="000"
+            record "GET / with bearer token" "200" "HTTP ${status}" "${IDENTITY}"
             if [[ "${status}" != "200" ]]; then
-              echo "  step 3 (GET / with bearer token, expect 200): HTTP ${status}"
+              fail_at "step 4 (GET / with bearer token, expect 200)" "HTTP ${status}"
               return 1
             fi
             return 0
           }
 
-          DEADLINE=$(( SECONDS + 180 ))
+          DEADLINE=$(( SECONDS + BUDGET ))
           ATTEMPT=0
           while :; do
             ATTEMPT=$(( ATTEMPT + 1 ))
             echo "attempt ${ATTEMPT}:"
             if attempt; then
-              echo "Health check passed: /health 200 anonymously, / 401 anonymously," \
-                "/ 200 as the end-to-end test client."
+              report passed
               exit 0
             fi
             if (( SECONDS >= DEADLINE )); then
@@ -484,8 +538,9 @@ jobs:
             sleep 10
           done
 
-          echo "::error::Health check failed after ${ATTEMPT} attempts (3-minute budget)." \
-            "See the step reached in each attempt above."
+          report failed
+          echo "::error::Smoke test failed after ${ATTEMPT} attempt(s) within the ${BUDGET} s budget;" \
+            "last step reached: ${LAST_STEP}, observed: ${LAST_OBSERVED}."
           exit 1
 
       - name: Confirm deployed version
