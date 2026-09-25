@@ -196,6 +196,7 @@ jobs:
         # aborts — leaving production untouched — if the new container fails
         # to start; the post-swap production wait and validation remain the
         # final health gate.
+        id: slot_wait
         if: inputs.environment != 'dev'
         run: |
           for i in 1 2 3 4 5 6 7 8 9 10 11 12; do
@@ -228,6 +229,7 @@ jobs:
         # The swap exchanges the warmed-up slot with production; the existing
         # production health wait and post-deploy validation then run against
         # the production slot as usual.
+        id: swap
         if: inputs.environment != 'dev'
         run: |
           az webapp deployment slot swap \
@@ -247,6 +249,7 @@ jobs:
         # 12 attempts × 10 s = up to 120 s of grace before the validation
         # steps run. Independent of network exposure, so this works for dev,
         # staging, and prod alike.
+        id: health_wait
         run: |
           WEBAPP_ID=$(az webapp show \
             --resource-group "${{ vars.AZURE_RESOURCE_GROUP }}" \
@@ -269,6 +272,73 @@ jobs:
 
           echo "::error::App Service did not reach healthy state after 12 attempts (120 s)."
           exit 1
+
+      - name: Diagnose failed deployment
+        # The waits only report a timeout; the reasons live in the slot state,
+        # the instances, the container log and the activity log. Surface them
+        # in the job log so a failed rollout is diagnosable without portal
+        # access. Container logs are read through ARM, so this also works for
+        # private-endpoint-only environments.
+        if: >-
+          failure() && (steps.slot_wait.outcome == 'failure' ||
+          steps.swap.outcome == 'failure' ||
+          steps.health_wait.outcome == 'failure')
+        env:
+          AZURE_RESOURCE_GROUP: ${{ vars.AZURE_RESOURCE_GROUP }}
+          AZURE_WEBAPP_NAME: ${{ vars.AZURE_WEBAPP_NAME }}
+          TARGET_ENV: ${{ inputs.environment }}
+        run: |
+          # Read-only; every command tolerates failure so the original error stays visible.
+          WEBAPP_ID=$(az webapp show --resource-group "${AZURE_RESOURCE_GROUP}" \
+            --name "${AZURE_WEBAPP_NAME}" --query id -o tsv 2>/dev/null || true)
+          SLOTS=(production)
+          [[ "${TARGET_ENV}" != "dev" ]] && SLOTS+=(staging)
+
+          for SLOT in "${SLOTS[@]}"; do
+            SLOT_ARG=(); SLOT_PATH=""
+            if [[ "${SLOT}" != "production" ]]; then
+              SLOT_ARG=(--slot "${SLOT}"); SLOT_PATH="/slots/${SLOT}"
+            fi
+
+            echo "::group::${SLOT} slot — state and configuration"
+            az webapp show --resource-group "${AZURE_RESOURCE_GROUP}" \
+              --name "${AZURE_WEBAPP_NAME}" "${SLOT_ARG[@]}" \
+              --query '{state:state, availability:availabilityState, enabled:enabled, host:defaultHostName, lastModified:lastModifiedTimeUtc}' \
+              -o table || true
+            az webapp config show --resource-group "${AZURE_RESOURCE_GROUP}" \
+              --name "${AZURE_WEBAPP_NAME}" "${SLOT_ARG[@]}" \
+              --query '{image:linuxFxVersion, healthCheckPath:healthCheckPath, alwaysOn:alwaysOn, workers:numberOfWorkers}' \
+              -o table || true
+            echo "::endgroup::"
+
+            echo "::group::${SLOT} slot — instances"
+            az rest --method GET \
+              --uri "https://management.azure.com${WEBAPP_ID}${SLOT_PATH}/instances?api-version=2024-04-01" \
+              --query 'value[].{instance:name, state:properties.state, containers:properties.containers | length(@)}' \
+              -o table || true
+            echo "::endgroup::"
+
+            echo "::group::${SLOT} slot — container log (last 200 lines)"
+            if az rest --method POST \
+                 --uri "https://management.azure.com${WEBAPP_ID}${SLOT_PATH}/containerlogs?api-version=2024-04-01" \
+                 --output-file "${RUNNER_TEMP}/container-${SLOT}.log" 2>/dev/null; then
+              tail -n 200 "${RUNNER_TEMP}/container-${SLOT}.log" || true
+            else
+              echo "(container log unavailable)"
+            fi
+            echo "::endgroup::"
+          done
+
+          echo "::group::Recent activity on the Web App (last 30 min)"
+          az monitor activity-log list --resource-group "${AZURE_RESOURCE_GROUP}" --offset 30m \
+            --query "[?contains(resourceId, '/sites/${AZURE_WEBAPP_NAME}')].{time:eventTimestamp, operation:operationName.localizedValue, status:status.value, subStatus:subStatus.localizedValue, message:properties.statusMessage}" \
+            -o table || true
+          echo "::endgroup::"
+
+          echo "::error::Deployment did not stabilize. Review the slot state, instances," \
+            "container log and recent activity above (a container that never reaches" \
+            "READY or restarts in a loop usually means the runtime configuration —" \
+            "e.g. PORT — does not match the app's contract, or the image failed to pull)."
 
       # -----------------------------------------------------------------------
       # Post-deploy validation:
