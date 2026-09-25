@@ -589,37 +589,32 @@ jobs:
           HOST=$(az webapp show -g "${RG}" -n "${APP}" --query defaultHostName -o tsv 2>/dev/null || echo "${APP}.azurewebsites.net")
           SETTINGS=$(az webapp config appsettings list -g "${RG}" -n "${APP}" \
             --query "[?name=='APP_NAME' || name=='APP_ENV' || name=='IMAGE_TAG'].join('=', [name, value])" \
-            -o tsv 2>/dev/null | sort | paste -sd' ' -)
+            -o tsv 2>/dev/null | sort | paste -sd' ' - || true)
           DIGEST=$(docker buildx imagetools inspect "${IMAGE_REF}" --format '{{.Manifest.Digest}}' 2>/dev/null || echo "unavailable")
 
           if [[ "${TARGET_ENV}" == "dev" ]]; then
             LOCATION="resource group ${RG} · web app ${APP} · in-place update of the production slot"
             ENDPOINTS="https://${HOST} (/health, /whois)"
-            OP="Microsoft.Web/sites/config/write"; OP_LABEL="container update"
+            OP_LABEL="container update"
           else
             LOCATION="resource group ${RG} · web app ${APP} · staging slot swapped into production"
             ENDPOINTS="https://${HOST} (/health, /whois) · private ingress, reachable inside the VNet only"
-            OP="Microsoft.Web/sites/slots/slotsswap/action"; OP_LABEL="slot swap"
+            OP_LABEL="slot swap"
           fi
 
-          # The control plane's own record of this deployment: the activity-log entries
-          # for the operation, on this Web App, since the recorded start. Ingestion can
-          # lag by minutes, so absence is reported rather than treated as failure.
-          EVENTS=$(az monitor activity-log list --resource-group "${RG}" --offset 1h \
-            --query "[?operationName.value=='${OP}' && contains(resourceId, '/sites/${APP}')].[eventTimestamp, status.value]" \
-            -o tsv 2>/dev/null | awk -v since="${STARTED_AT}" '$1 >= since' | sort)
-          if [[ -z "${EVENTS}" ]]; then
-            CONTROL="${OP_LABEL}: not yet visible in the activity log (ingestion lag)"
-          else
-            CP_START=$(awk 'NR == 1 { print $1 }' <<<"${EVENTS}")
-            TERMINAL=$(awk '$2 != "Started"' <<<"${EVENTS}" | tail -n 1)
-            if [[ -n "${TERMINAL}" ]]; then
-              CP_END=$(awk '{ print $1 }' <<<"${TERMINAL}"); CP_STATUS=$(awk '{ print $2 }' <<<"${TERMINAL}")
-            else
-              CP_END="pending"; CP_STATUS="Started"
-            fi
-            CONTROL="${OP_LABEL} started ${CP_START} · completed ${CP_END} · status ${CP_STATUS}"
-          fi
+          # The control plane's own record of this deployment, from instant reads:
+          # lastModifiedTimeUtc is set by the config writes (dev) and by the slot
+          # swap (staging/prod); instance readiness, state and availability come
+          # from ARM. A dict query keeps the three site fields on one tsv line.
+          IFS=$'\t' read -r LAST_MODIFIED STATE AVAIL <<<"$(az webapp show -g "${RG}" -n "${APP}" \
+            --query '{m:lastModifiedTimeUtc, s:state, a:availabilityState}' -o tsv 2>/dev/null || printf 'unavailable\tunavailable\tunavailable')"
+          APPLIED="${LAST_MODIFIED%%.*}"; [[ "${APPLIED}" == "unavailable" || "${APPLIED}" == *Z ]] || APPLIED="${APPLIED}Z"
+          WEBAPP_ID=$(az webapp show -g "${RG}" -n "${APP}" --query id -o tsv 2>/dev/null || true)
+          STATES=$(az rest --method GET \
+            --uri "https://management.azure.com${WEBAPP_ID}/instances?api-version=2024-04-01" \
+            --query "value[].properties.state" -o tsv 2>/dev/null || true)
+          TOTAL=$(grep -c . <<<"${STATES}" || true); READY=$(grep -c '^READY$' <<<"${STATES}" || true)
+          CONTROL="${OP_LABEL} applied ${APPLIED} · ${READY}/${TOTAL} instance(s) READY · state ${STATE} · availability ${AVAIL}"
 
           row "Environment"    "${TARGET_ENV} (Azure App Service)"
           row "Image"          "${IMAGE_REF}"
