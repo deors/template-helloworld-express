@@ -645,7 +645,7 @@ jobs:
             local title="$1" r label value
             echo "=== ${title} ==="
             {
-              echo "## ${title}"; echo; echo "| Field | Value |"; echo "|---|---|"
+              echo "## ${title}"; echo; echo "|   |   |"; echo "|---|---|"
             } >> "$GITHUB_STEP_SUMMARY"
             for r in "${ROWS[@]}"; do
               label="${r%%|*}"; value="${r#*|}"
