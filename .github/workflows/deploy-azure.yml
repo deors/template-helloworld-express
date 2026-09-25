@@ -586,8 +586,7 @@ jobs:
           DEPLOYED=$(az webapp config show -g "${RG}" -n "${APP}" --query linuxFxVersion -o tsv 2>/dev/null || echo "unavailable")
           # App Service prefixes the container image with DOCKER|.
           DEPLOYED="${DEPLOYED#DOCKER|}"
-          read -r HOST LAST_MODIFIED <<<"$(az webapp show -g "${RG}" -n "${APP}" \
-            --query '[defaultHostName, lastModifiedTimeUtc]' -o tsv 2>/dev/null || echo "${APP}.azurewebsites.net unavailable")"
+          HOST=$(az webapp show -g "${RG}" -n "${APP}" --query defaultHostName -o tsv 2>/dev/null || echo "${APP}.azurewebsites.net")
           SETTINGS=$(az webapp config appsettings list -g "${RG}" -n "${APP}" \
             --query "[?name=='APP_NAME' || name=='APP_ENV' || name=='IMAGE_TAG'].join('=', [name, value])" \
             -o tsv 2>/dev/null | sort | paste -sd' ' -)
@@ -596,9 +595,30 @@ jobs:
           if [[ "${TARGET_ENV}" == "dev" ]]; then
             LOCATION="resource group ${RG} · web app ${APP} · in-place update of the production slot"
             ENDPOINTS="https://${HOST} (/health, /whois)"
+            OP="Microsoft.Web/sites/config/write"; OP_LABEL="container update"
           else
             LOCATION="resource group ${RG} · web app ${APP} · staging slot swapped into production"
             ENDPOINTS="https://${HOST} (/health, /whois) · private ingress, reachable inside the VNet only"
+            OP="Microsoft.Web/sites/slots/slotsswap/action"; OP_LABEL="slot swap"
+          fi
+
+          # The control plane's own record of this deployment: the activity-log entries
+          # for the operation, on this Web App, since the recorded start. Ingestion can
+          # lag by minutes, so absence is reported rather than treated as failure.
+          EVENTS=$(az monitor activity-log list --resource-group "${RG}" --offset 1h \
+            --query "[?operationName.value=='${OP}' && contains(resourceId, '/sites/${APP}')].[eventTimestamp, status.value]" \
+            -o tsv 2>/dev/null | awk -v since="${STARTED_AT}" '$1 >= since' | sort)
+          if [[ -z "${EVENTS}" ]]; then
+            CONTROL="${OP_LABEL}: not yet visible in the activity log (ingestion lag)"
+          else
+            CP_START=$(awk 'NR == 1 { print $1 }' <<<"${EVENTS}")
+            TERMINAL=$(awk '$2 != "Started"' <<<"${EVENTS}" | tail -n 1)
+            if [[ -n "${TERMINAL}" ]]; then
+              CP_END=$(awk '{ print $1 }' <<<"${TERMINAL}"); CP_STATUS=$(awk '{ print $2 }' <<<"${TERMINAL}")
+            else
+              CP_END="pending"; CP_STATUS="Started"
+            fi
+            CONTROL="${OP_LABEL} started ${CP_START} · completed ${CP_END} · status ${CP_STATUS}"
           fi
 
           row "Environment"    "${TARGET_ENV} (Azure App Service)"
@@ -609,5 +629,5 @@ jobs:
           row "Location"       "${LOCATION}"
           row "Endpoints"      "${ENDPOINTS}"
           row "Timing"         "started ${STARTED_AT} · ready ${READY_AT} ($(elapsed "${STARTED_AT}" "${READY_AT}")) · validated ${NOW} ($(elapsed "${STARTED_AT}" "${NOW}") total)"
-          row "Control plane"  "web app last modified ${LAST_MODIFIED}"
+          row "Control plane"  "${CONTROL}"
           render "Deployed version — ${TARGET_ENV} (Azure)"
