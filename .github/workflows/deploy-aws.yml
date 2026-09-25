@@ -96,6 +96,8 @@ jobs:
           REPO=$(echo "${GITHUB_REPOSITORY##*/}" | tr '[:upper:]' '[:lower:]')
           echo "ref=ghcr.io/${OWNER}/${REPO}:${{ inputs.image_tag }}" >> "$GITHUB_OUTPUT"
           echo "app_name=${GITHUB_REPOSITORY##*/}" >> "$GITHUB_OUTPUT"
+          # Anchors the deployment timing reported by the final step.
+          echo "started_at=$(date -u +%FT%TZ)" >> "$GITHUB_OUTPUT"
 
       - name: Register task definition revision
         # A single-container task is assumed (this template's app). Image and
@@ -159,6 +161,7 @@ jobs:
             --cluster  "${{ vars.AWS_ECS_CLUSTER }}" \
             --services "${{ vars.AWS_ECS_SERVICE }}"
           echo "Service reached steady state."
+          echo "ready_at=$(date -u +%FT%TZ)" >> "$GITHUB_OUTPUT"
 
       - name: Create CodeDeploy deployment (blue/green)
         # CODE_DEPLOY-controlled services reject `ecs update-service`; the new
@@ -264,6 +267,7 @@ jobs:
             case "${STATUS}" in
               Succeeded)
                 echo "Deployment succeeded and traffic fully shifted."
+                echo "ready_at=$(date -u +%FT%TZ)" >> "$GITHUB_OUTPUT"
                 exit 0
                 ;;
               Failed|Stopped)
@@ -547,7 +551,87 @@ jobs:
           exit 1
 
       - name: Confirm deployed version
+        # Same fields, same order as the other cloud workflows; sourced from
+        # the control plane after the deployment and mirrored to the step
+        # summary. Only the three known runtime keys are printed.
+        env:
+          AWS_REGION: ${{ vars.AWS_REGION }}
+          AWS_ECS_CLUSTER: ${{ vars.AWS_ECS_CLUSTER }}
+          AWS_ECS_SERVICE: ${{ vars.AWS_ECS_SERVICE }}
+          APP_URL: ${{ vars.AWS_APP_URL }}
+          TARGET_ENV: ${{ inputs.environment }}
+          IMAGE_REF: ${{ steps.image.outputs.ref }}
+          TASKDEF_ARN: ${{ steps.taskdef.outputs.arn }}
+          CONTROLLER: ${{ steps.controller.outputs.type }}
+          DEPLOYMENT_ID: ${{ steps.bg_deploy.outputs.deployment_id }}
+          STARTED_AT: ${{ steps.image.outputs.started_at }}
+          READY_AT: ${{ steps.wait.outputs.ready_at || steps.bg_wait.outputs.ready_at }}
         run: |
-          echo "Deployed image   : ${{ steps.image.outputs.ref }}"
-          echo "Task definition  : ${{ steps.taskdef.outputs.arn }}"
-          echo "Cluster / service: ${{ vars.AWS_ECS_CLUSTER }} / ${{ vars.AWS_ECS_SERVICE }}"
+          NOW=$(date -u +%FT%TZ)
+          elapsed() {
+            python3 - "$1" "$2" <<'PY' 2>/dev/null || echo "n/a"
+          import sys, datetime as d
+          try:
+              a, b = [d.datetime.strptime(x[:19], "%Y-%m-%dT%H:%M:%S") for x in sys.argv[1:]]
+              s = int((b - a).total_seconds()); print(f"{s // 60}m{s % 60:02d}s")
+          except Exception:
+              print("n/a")
+          PY
+          }
+          ROWS=()
+          row() { ROWS+=("$1|$2"); }
+          render() {
+            local title="$1" r label value
+            echo "=== ${title} ==="
+            {
+              echo "## ${title}"; echo; echo "| Field | Value |"; echo "|---|---|"
+            } >> "$GITHUB_STEP_SUMMARY"
+            for r in "${ROWS[@]}"; do
+              label="${r%%|*}"; value="${r#*|}"
+              printf '%-16s: %s\n' "${label}" "${value}"
+              echo "| ${label} | ${value//|/\\|} |" >> "$GITHUB_STEP_SUMMARY"
+            done
+            echo >> "$GITHUB_STEP_SUMMARY"
+          }
+
+          CLUSTER="${AWS_ECS_CLUSTER}"; SERVICE="${AWS_ECS_SERVICE}"
+          read -r DEPLOYED SETTINGS_RAW <<<"$(aws ecs describe-task-definition --task-definition "${TASKDEF_ARN}" \
+            --query "taskDefinition.containerDefinitions[0].[image, join(' ', environment[?name=='APP_NAME' || name=='APP_ENV' || name=='IMAGE_TAG'].join('=', [name, value]))]" \
+            --output text 2>/dev/null || echo "unavailable")"
+          SETTINGS=$(tr ' ' '\n' <<<"${SETTINGS_RAW}" | sort | paste -sd' ' -)
+          TASK=$(aws ecs list-tasks --cluster "${CLUSTER}" --service-name "${SERVICE}" --desired-status RUNNING \
+            --query 'taskArns[0]' --output text 2>/dev/null || true)
+          DIGEST="unavailable"
+          if [[ -n "${TASK}" && "${TASK}" != "None" ]]; then
+            DIGEST=$(aws ecs describe-tasks --cluster "${CLUSTER}" --tasks "${TASK}" \
+              --query 'tasks[0].containers[0].imageDigest' --output text 2>/dev/null || echo "unavailable")
+          fi
+
+          if [[ "${CONTROLLER}" == "CODE_DEPLOY" ]]; then
+            MODE="controller CODE_DEPLOY (blue/green, deployment ${DEPLOYMENT_ID})"
+            read -r CP_START CP_END CP_STATUS <<<"$(aws deploy get-deployment --deployment-id "${DEPLOYMENT_ID}" \
+              --query 'deploymentInfo.[createTime, completeTime, status]' --output text 2>/dev/null || echo "unavailable unavailable unavailable")"
+            CONTROL="CodeDeploy deployment created ${CP_START} · completed ${CP_END} · status ${CP_STATUS}"
+          else
+            MODE="controller ECS (rolling)"
+            read -r CP_START CP_END CP_STATUS <<<"$(aws ecs describe-services --cluster "${CLUSTER}" --services "${SERVICE}" \
+              --query "services[0].deployments[?status=='PRIMARY'] | [0].[createdAt, updatedAt, rolloutState]" --output text 2>/dev/null || echo "unavailable unavailable unavailable")"
+            CONTROL="primary deployment created ${CP_START} · updated ${CP_END} · rollout ${CP_STATUS}"
+          fi
+          LOCATION="region ${AWS_REGION} · cluster ${CLUSTER} · service ${SERVICE} · task definition ${TASKDEF_ARN##*/} · ${MODE}"
+          if [[ "${TARGET_ENV}" == "dev" ]]; then
+            ENDPOINTS="${APP_URL} (/health, /whois)"
+          else
+            ENDPOINTS="private ingress, reachable inside the VPC only"
+          fi
+
+          row "Environment"    "${TARGET_ENV} (AWS ECS Fargate)"
+          row "Image"          "${IMAGE_REF}"
+          row "Deployed image" "${DEPLOYED}"
+          row "Digest"         "${DIGEST}"
+          row "Runtime config" "${SETTINGS:-unavailable}"
+          row "Location"       "${LOCATION}"
+          row "Endpoints"      "${ENDPOINTS}"
+          row "Timing"         "started ${STARTED_AT} · ready ${READY_AT} ($(elapsed "${STARTED_AT}" "${READY_AT}")) · validated ${NOW} ($(elapsed "${STARTED_AT}" "${NOW}") total)"
+          row "Control plane"  "${CONTROL}"
+          render "Deployed version — ${TARGET_ENV} (AWS)"
