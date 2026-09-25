@@ -279,12 +279,16 @@ jobs:
       #               • az webapp config show   → linuxFxVersion contains
       #                                           the expected image tag
       #
-      #   dev only — additionally, an HTTP smoke test of /health over the
-      #             public endpoint (public_network_access_enabled=true in
-      #             Terraform). Staging/prod are private-endpoint-only and
-      #             unreachable from GitHub-hosted runners; to use HTTP
-      #             validation there, provision self-hosted runners inside
-      #             the VNet and remove the environment condition below.
+      #   dev only — additionally, an HTTP smoke test over the public
+      #             endpoint (public_network_access_enabled=true in
+      #             Terraform): /health anonymously (excluded from
+      #             authentication), / anonymously (must be 401) and / as
+      #             the environment's end-to-end test client (credentials
+      #             in the environment's Key Vault). Staging/prod are
+      #             private-endpoint-only and unreachable from GitHub-hosted
+      #             runners; to use HTTP validation there, provision
+      #             self-hosted runners inside the VNet and remove the
+      #             environment condition below.
       # -----------------------------------------------------------------------
 
       - name: Validate – control-plane assertions
@@ -310,24 +314,102 @@ jobs:
           echo "Control-plane validation passed."
 
       - name: Validate – HTTP smoke test (dev)
+        # App Service authentication gates every path except /health, so the
+        # test also proves the image answers through the gate: / must be 401
+        # anonymously and 200 with a client-credentials token for the
+        # environment's end-to-end test client, whose e2e-* secrets live in
+        # the environment's Key Vault.
         if: inputs.environment == 'dev'
+        env:
+          AZURE_WEBAPP_NAME: ${{ vars.AZURE_WEBAPP_NAME }}
         run: |
-          WEBAPP_URL="https://${{ vars.AZURE_WEBAPP_NAME }}.azurewebsites.net"
-          echo "Smoke-testing ${WEBAPP_URL}/health …"
+          set +x
+          WEBAPP_URL="https://${AZURE_WEBAPP_NAME}.azurewebsites.net"
+          # Vault name: kv-<app>-<env>, cut to 24 characters, no trailing hyphen.
+          VAULT="kv-${AZURE_WEBAPP_NAME#app-}"
+          VAULT="${VAULT:0:24}"
+          VAULT="${VAULT%-}"
 
-          for i in $(seq 1 18); do
-            STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
-              --max-time 10 \
-              "${WEBAPP_URL}/health" || echo "000")
-            echo "  attempt ${i}: HTTP ${STATUS}"
-            if [ "${STATUS}" = "200" ]; then
-              echo "Health check passed."
+          echo "Smoke-testing ${WEBAPP_URL}: /health anonymously, / anonymously (expect 401)," \
+            "and / as the end-to-end test client (credentials in ${VAULT}) …"
+
+          read_secret() {
+            az keyvault secret show --vault-name "${VAULT}" --name "$1" --query value -o tsv
+          }
+          TENANT_ID=$(read_secret e2e-tenant-id)
+          CLIENT_ID=$(read_secret e2e-client-id)
+          CLIENT_SECRET=$(read_secret e2e-client-secret)
+          SCOPE=$(read_secret e2e-scope)
+          if [[ -z "${TENANT_ID}" || -z "${CLIENT_ID}" || -z "${CLIENT_SECRET}" || -z "${SCOPE}" ]]; then
+            echo "::error::Key Vault ${VAULT} must hold non-empty e2e-tenant-id, e2e-client-id," \
+              "e2e-client-secret and e2e-scope secrets."
+            exit 1
+          fi
+          echo "::add-mask::${CLIENT_SECRET}"
+          TOKEN_URL="https://login.microsoftonline.com/${TENANT_ID}/oauth2/v2.0/token"
+
+          # One attempt = the three checks in order. Prints the step reached and the
+          # status (never bodies, tokens or secrets) and returns non-zero on any
+          # mismatch so the caller can retry.
+          attempt() {
+            local status token
+
+            # 1. The health path is excluded from authentication.
+            status=$(curl -sS --max-time 10 -o /dev/null -w '%{http_code}' \
+                     "${WEBAPP_URL}/health") || status="000"
+            if [[ "${status}" != "200" ]]; then
+              echo "  step 1 (GET /health anonymously, expect 200): HTTP ${status}"
+              return 1
+            fi
+
+            # 2. Everything else is gated: an API client without a token gets 401.
+            status=$(curl -sS --max-time 10 -o /dev/null -w '%{http_code}' \
+                     -H 'Accept: application/json' "${WEBAPP_URL}/") || status="000"
+            if [[ "${status}" != "401" ]]; then
+              echo "  step 2 (GET / anonymously, expect 401): HTTP ${status}"
+              return 1
+            fi
+
+            # 3. Client-credentials token for the test client, then GET / with it.
+            token=$(curl -sS --max-time 15 -X POST "${TOKEN_URL}" \
+                      --data-urlencode "grant_type=client_credentials" \
+                      --data-urlencode "client_id=${CLIENT_ID}" \
+                      --data-urlencode "client_secret=${CLIENT_SECRET}" \
+                      --data-urlencode "scope=${SCOPE}" \
+                    | jq -r '.access_token // empty') || token=""
+            if [[ -z "${token}" ]]; then
+              echo "  step 3 (token request for the test client): no access token returned" \
+                "— check the e2e-* secrets and the client's credentials"
+              return 1
+            fi
+            echo "::add-mask::${token}"
+            status=$(curl -sS --max-time 10 -o /dev/null -w '%{http_code}' \
+                     -H "Authorization: Bearer ${token}" "${WEBAPP_URL}/") || status="000"
+            if [[ "${status}" != "200" ]]; then
+              echo "  step 3 (GET / with bearer token, expect 200): HTTP ${status}"
+              return 1
+            fi
+            return 0
+          }
+
+          DEADLINE=$(( SECONDS + 180 ))
+          ATTEMPT=0
+          while :; do
+            ATTEMPT=$(( ATTEMPT + 1 ))
+            echo "attempt ${ATTEMPT}:"
+            if attempt; then
+              echo "Health check passed: /health 200 anonymously, / 401 anonymously," \
+                "/ 200 as the end-to-end test client."
               exit 0
+            fi
+            if (( SECONDS >= DEADLINE )); then
+              break
             fi
             sleep 10
           done
 
-          echo "Health check timed out after 3 minutes."
+          echo "::error::Health check failed after ${ATTEMPT} attempts (3-minute budget)." \
+            "See the step reached in each attempt above."
           exit 1
 
       - name: Confirm deployed version
